@@ -12,23 +12,111 @@ from numpy.typing import ArrayLike
 from astrometry.catalog_queries import query_catalog
 
 
-def compute_hash_code(quad_ra: ArrayLike[float], quad_dec: ArrayLike[float]) -> Tuple[float, float, float, float]:
+def compute_hash_code(quad_ra: ArrayLike[float], quad_dec: ArrayLike[float], debug=False) -> Tuple[float, float, float, float] | None:
     """
     Compute a hash code for a quad of stars based on their relative positions.
+
+    Parameters:
+        quad_ra (ArrayLike[float]): Right ascension of the four stars in degrees.
+        quad_dec (ArrayLike[float]): Declination of the four stars in degrees.
+    Returns:
+        Tuple[float, float, float, float] | None: The hash code as (x_c, y_c, x_d, y_d) or None if the quad is invalid.
     """
     # Get two most widely separated stars in the quad, which will be used to define local coordinate system
     dist = np.sqrt((quad_ra[:, np.newaxis] - quad_ra[np.newaxis, :])**2 + (quad_dec[:, np.newaxis] - quad_dec[np.newaxis, :])**2)
     max_dist_indices = np.unravel_index(np.argmax(dist, axis=None), dist.shape)
-    star1_idx, star2_idx = max_dist_indices
+    star_a_idx, star_b_idx = max_dist_indices
+    star_c_idx, star_d_idx = [i for i in range(4) if i not in max_dist_indices]
 
-    # Define local coordinate system with star1 at origin and star2 at (1, 1)
-    star1_ra = quad_ra[star1_idx]
-    star1_dec = quad_dec[star1_idx]
-    star2_ra = quad_ra[star2_idx]
-    star2_dec = quad_dec[star2_idx]
+    # Determine if both star c and star d fall in the circle defined by star a and star b
+    diam = dist[star_a_idx, star_b_idx]
+    center_ra = (quad_ra[star_a_idx] + quad_ra[star_b_idx]) / 2
+    center_dec = (quad_dec[star_a_idx] + quad_dec[star_b_idx]) / 2
+    radius = diam / 2
 
+    def is_within_circle(star_idx):
+        d = np.sqrt((quad_ra[star_idx] - center_ra)**2 + (quad_dec[star_idx] - center_dec)**2)
+        return d < radius
 
+    if not (is_within_circle(star_c_idx) and is_within_circle(star_d_idx)):
+        return None  # Quad is invalid
 
+    # Define local coordinate system with star A at origin and star B at (1, 1)
+    star_a_ra = quad_ra[star_a_idx]
+    star_a_dec = quad_dec[star_a_idx]
+    star_b_ra = quad_ra[star_b_idx]
+    star_b_dec = quad_dec[star_b_idx]
+
+    # Compute affine transformation parameters
+    # Reference: https://math.stackexchange.com/questions/2982975/geometric-hash-code-or-is-there-a-unique-affine-transformation-mapping-two-2d-po
+    delta_ra = star_b_ra - star_a_ra
+    delta_dec = star_b_dec - star_a_dec
+
+    theta = (np.pi / 4) - np.arctan2(delta_dec, delta_ra)
+    lam = np.sqrt(2) * (1 / np.sqrt(delta_ra**2 + delta_dec**2))
+
+    t_x = lam * (-star_a_ra * np.cos(theta) + star_a_dec * np.sin(theta))
+    t_y = lam * (-star_a_dec * np.sin(theta) - star_a_ra * np.cos(theta))
+
+    T = np.array([
+        [lam * np.cos(theta), -lam * np.sin(theta), t_x],
+        [lam * np.sin(theta),  lam * np.cos(theta), t_y],
+        [0.,                   0.,                  1. ]
+    ])
+
+    # Apply transformation to all stars in quad
+    coords = np.vstack((quad_ra, quad_dec, np.ones(4)))
+    transformed_coords = T @ coords
+    x_c = transformed_coords[0, star_c_idx]
+    y_c = transformed_coords[1, star_c_idx]
+    x_d = transformed_coords[0, star_d_idx]
+    y_d = transformed_coords[1, star_d_idx]
+
+    # Ensure consistent ordering of stars c and d
+    if x_c > x_d:
+        x_c, x_d = x_d, x_c
+        y_c, y_d = y_d, y_c
+        star_c_idx, star_d_idx = star_d_idx, star_c_idx
+
+    # Ensure x_c + x_d <= 1
+    if x_c + x_d > 1:
+        return None  # Quad is invalid
+
+    if debug:
+        # Plot quad and transformed coordinates for debugging
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+        ax[0].plot([quad_ra[star_a_idx], quad_ra[star_d_idx]], [quad_dec[star_a_idx], quad_dec[star_d_idx]], 'go-')
+        ax[0].plot([quad_ra[star_d_idx], quad_ra[star_b_idx]], [quad_dec[star_d_idx], quad_dec[star_b_idx]], 'go-')
+        ax[0].plot([quad_ra[star_b_idx], quad_ra[star_c_idx]], [quad_dec[star_b_idx], quad_dec[star_c_idx]], 'go-')
+        ax[0].plot([quad_ra[star_c_idx], quad_ra[star_a_idx]], [quad_dec[star_c_idx], quad_dec[star_a_idx]], 'go-')
+
+        ax[0].text(quad_ra[star_c_idx], quad_dec[star_c_idx], 'C', color='green', fontsize=12)
+        ax[0].text(quad_ra[star_d_idx], quad_dec[star_d_idx], 'D', color='green', fontsize=12)
+        ax[0].text(quad_ra[star_a_idx], quad_dec[star_a_idx], 'A', color='green', fontsize=12)
+        ax[0].text(quad_ra[star_b_idx], quad_dec[star_b_idx], 'B', color='green', fontsize=12)
+
+        ax[0].set_title('Original Quad')
+        ax[0].set_xlabel('RA (deg)')
+        ax[0].set_ylabel('Dec (deg)')
+
+        ax[1].scatter(transformed_coords[0, :], transformed_coords[1, :])
+        ax[1].plot([transformed_coords[0, star_a_idx], transformed_coords[0, star_d_idx]], [transformed_coords[1, star_a_idx], transformed_coords[1, star_d_idx]], 'go-')
+        ax[1].plot([transformed_coords[0, star_d_idx], transformed_coords[0, star_b_idx]], [transformed_coords[1, star_d_idx], transformed_coords[1, star_b_idx]], 'go-')
+        ax[1].plot([transformed_coords[0, star_b_idx], transformed_coords[0, star_c_idx]], [transformed_coords[1, star_b_idx], transformed_coords[1, star_c_idx]], 'go-')
+        ax[1].plot([transformed_coords[0, star_c_idx], transformed_coords[0, star_a_idx]], [transformed_coords[1, star_c_idx], transformed_coords[1, star_a_idx]], 'go-')
+
+        ax[1].text(x_c, y_c, 'C', color='green', fontsize=12)
+        ax[1].text(x_d, y_d, 'D', color='green', fontsize=12)
+        ax[1].text(transformed_coords[0, star_a_idx], transformed_coords[1, star_a_idx], 'A', color='green', fontsize=12)
+        ax[1].text(transformed_coords[0, star_b_idx], transformed_coords[1, star_b_idx], 'B', color='green', fontsize=12)
+
+        ax[1].set_title('Transformed Quad')
+        ax[1].set_xlabel('X')
+        ax[1].set_ylabel('Y')
+        plt.show()
+
+    return (x_c, y_c, x_d, y_d)
 
 
 def generate_astrometric_features(star_ra: ArrayLike[float], star_dec: ArrayLike[float], 

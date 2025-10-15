@@ -91,6 +91,30 @@ def is_satellite_illuminated(tle_line1: str, tle_line2: str, time_utc: str) -> b
     return cos_angle > 0.
 
 
+def get_sensor_slew_rate(satellite, sensor_fov_deg: float, t_start: float, t_end: float) -> float:
+    """
+    Calculate the required slew rate for a sensor to center target satellite over collection.
+
+    Parameters:
+    sensor_fov_deg (float): Sensor field of view in degrees.
+    exposure_time_s (float): Exposure time in seconds.
+
+    Returns:
+    float: Required slew rate in degrees per second.
+    """
+    if t_end <= t_start:
+        raise ValueError("End time must be greater than start time.")
+    duration_s = t_end - t_start
+
+    # Get rate of change of satellite position in degrees per second
+    sat_at_start = satellite.at(t_start)
+    sat_at_end = satellite.at(t_end)
+    ra_start, dec_start, _ = sat_at_start.radec()
+    ra_end, dec_end, _ = sat_at_end.radec()
+
+    return sensor_fov_deg / duration_s
+
+
 if __name__ == "__main__":
     import json
     import argparse
