@@ -5,6 +5,7 @@ Authors: Peter Thomas
 Date: 2025-10-10
 """
 import argparse
+import itertools
 import numpy as np
 from typing import Tuple
 from numpy.typing import ArrayLike
@@ -121,7 +122,8 @@ def compute_hash_code(quad_ra: ArrayLike[float], quad_dec: ArrayLike[float], deb
 
 def generate_astrometric_features(star_ra: ArrayLike[float], star_dec: ArrayLike[float], 
                                   star_mv: ArrayLike[float], grid_ra: Tuple[float, float], 
-                                  grid_dec: Tuple[float, float], num_passes: int=16) -> np.ndarray:
+                                  grid_dec: Tuple[float, float], num_passes: int=16, 
+                                  max_times_used: int=8) -> np.ndarray:
     """
     Generate astrometric features from star positions for a given grid
     """
@@ -132,10 +134,36 @@ def generate_astrometric_features(star_ra: ArrayLike[float], star_dec: ArrayLike
     star_mv = star_mv[sorted_indices]
 
     # Array to keep track of number of times a star has been used to generate a feature
-    used_stars = np.zeros(len(star_ra), dtype=int)
+    num_times_used = np.zeros(len(star_ra), dtype=int)
 
+    geometric_hash_codes = []
+    for _ in range(num_passes):
+        possible_star_quads = itertools.product(range(len(star_ra)), repeat=4)
+        for quad in possible_star_quads:
+            # Check if any star in the quad has been used too many times
+            if any(num_times_used[star_idx] >= max_times_used for star_idx in quad):
+                continue
 
-    pass
+            # Determine if center of quad falls within grid
+            quad_ra = star_ra[list(quad)]
+            quad_dec = star_dec[list(quad)]
+            center_ra = np.mean(quad_ra)
+            center_dec = np.mean(quad_dec)
+            if not (grid_ra[0] <= center_ra <= grid_ra[1] and grid_dec[0] <= center_dec <= grid_dec[1]):
+                continue
+
+            # Generate geometric hash code for this quad
+            hash_code = compute_hash_code(quad_ra, quad_dec)
+            if hash_code is None:
+                continue  # Invalid quad
+
+            geometric_hash_codes.append(hash_code)
+
+            # Update the number of times each star in the quad has been used
+            for star_idx in quad:
+                num_times_used[star_idx] += 1
+
+    return np.array(geometric_hash_codes)
 
 
 def iterate_over_celestial_grids(grid_size: Tuple[float, float], max_ra: float, max_dec: float, min_ra: float, min_dec: float):
@@ -171,12 +199,14 @@ def iterate_over_celestial_grids(grid_size: Tuple[float, float], max_ra: float, 
             center_ra = (max_search_ra + min_search_ra) / 2
             center_dec = (max_search_dec + min_search_dec) / 2
 
-            stars = query_catalog(center_ra, center_dec, fov_width, fov_height, catalog_name="Gaia")
+            stars = query_catalog(center_ra, center_dec, fov_width, fov_height, catalog_name="Gaia", row_limit=1000)
 
             # Generate astrometric features for this grid
-            features = generate_astrometric_features(stars['ra'], stars['dec'],
-                                                    (grid_ra, grid_ra + ra_size),
-                                                    (grid_dec, grid_dec + dec_size))
+            hash_codes = generate_astrometric_features(stars['ra'], stars['dec'],
+                                                      (grid_ra, grid_ra + ra_size),
+                                                      (grid_dec, grid_dec + dec_size))
+
+            
 
 
 if __name__ == "__main__":
