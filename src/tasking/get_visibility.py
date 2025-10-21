@@ -112,6 +112,9 @@ def get_sensor_slew_rate(satellite, sensor_fov_deg: float, t_start: float, t_end
     ra_start, dec_start, _ = sat_at_start.radec()
     ra_end, dec_end, _ = sat_at_end.radec()
 
+    delta_ra = ra_end.degrees - ra_start.degrees
+    delta_dec = dec_end.degrees - dec_start.degrees
+
     return sensor_fov_deg / duration_s
 
 
