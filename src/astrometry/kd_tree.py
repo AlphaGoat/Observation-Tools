@@ -1,102 +1,1034 @@
 """
-KD Tree implementation for efficient spatial searches for our geometric hash codes.
+KD-tree index and plate solver for astrometric calibration.
+
+Two scipy.spatial.cKDTree instances back the index:
+  CodeSpaceTree    — 4D tree over (xC, yC, xD, yD) hash codes for one scale tier
+  StarPositionTree — 3D tree over XYZ unit-sphere positions (avoids cos(dec) distortion near poles)
+
+Indices are built per scale tier (each spanning a √2 factor in quad AB diameter).
+PlateSolver accepts a list of CodeSpaceTrees and selects the relevant tier(s) at
+solve time based on the image FOV.
+
+Build a tiered index (offline, once):
+    from astrometry.kd_tree import build_index_tiered, SCALE_TIERS
+    build_index_tiered(
+        sky_region=dict(min_ra=0, max_ra=10, min_dec=-5, max_dec=5),
+        tier_indices=[8, 9, 10, 11],           # ~0.8–4.5° quad AB diameter
+        index_dir="indices/",
+        star_index_path="indices/stars.joblib",
+    )
+
+Field solve (online, per image):
+    from astrometry.kd_tree import CodeSpaceTree, StarPositionTree, PlateSolver
+    import glob
+    code_trees = [CodeSpaceTree.load(p) for p in sorted(glob.glob("indices/codes_tier*.joblib"))]
+    star_tree  = StarPositionTree.load("indices/stars.joblib")
+    solver = PlateSolver(code_trees, star_tree)
+    wcs = solver.solve(detected_stars, image_height=2048, image_width=2048, fov_deg=2.0)
 
 Authors: Peter Thomas
-Date: 2025-10-15
 """
+
+import itertools
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import joblib
 import numpy as np
-from typing import Tuple
-from ABC import ABC, abstractmethod
+from scipy.spatial import cKDTree
+
+from astrometry.feature_generation import compute_hash_code
+from astrometry.bayesian_decision_maker import bayesian_decision_maker
 
 
-class Node(ABC):
-    @abstractmethod
-    def __init__(self):
-        pass
+# ── Scale tier definitions ────────────────────────────────────────────────────
+
+# Each tier covers a √2 factor in quad AB angular diameter (degrees).
+# Tier N spans [base * (√2)^N, base * (√2)^(N+1)] where base ≈ 0.05°.
+# These match Astrometry.net's preset index scale bands.
+SCALE_TIERS: dict = {
+    0:  (0.050, 0.071),
+    1:  (0.071, 0.100),
+    2:  (0.100, 0.141),
+    3:  (0.141, 0.200),
+    4:  (0.200, 0.283),
+    5:  (0.283, 0.400),
+    6:  (0.400, 0.566),
+    7:  (0.566, 0.800),
+    8:  (0.800, 1.131),
+    9:  (1.131, 1.600),
+    10: (1.600, 2.263),
+    11: (2.263, 3.200),
+    12: (3.200, 4.525),
+    13: (4.525, 6.400),
+    14: (6.400, 9.051),
+    15: (9.051, 12.80),
+}
 
 
-class InternalNode(Node):
-    left_child: Node = None
-    right_child: Node = None
+def _ab_sep_deg(ra: np.ndarray, dec: np.ndarray) -> float:
+    """
+    Return the angular separation in degrees of the most-separated star pair
+    in a 4-star group, using the flat-sky cos(dec) approximation (valid < ~10°).
+    """
+    mean_dec = (dec[:, None] + dec[None, :]) / 2
+    dist = np.sqrt(
+        ((ra[:, None] - ra[None, :]) * np.cos(np.radians(mean_dec))) ** 2
+        + (dec[:, None] - dec[None, :]) ** 2
+    )
+    return float(dist.max())
 
 
-class SplittingNode(InternalNode):
-    split_dimension: int = None
-    split_position: float = None
+# ── WCS ──────────────────────────────────────────────────────────────────────
 
-    def __init__(self):
-        pass
+@dataclass
+class WCS:
+    """
+    Affine WCS: [x_pix, y_pix]ᵀ = A @ [ra_deg, dec_deg, 1]ᵀ
+    A is shape (2, 3), float64.
+    """
+    A: np.ndarray
 
-
-class BoundingBoxNode(InternalNode):
-    lower_bounds: np.ndarray = None
-    upper_bounds: np.ndarray = None
-
-    def __init__(self):
-        pass
-
-
-class LeafNode(Node):
-    data: np.ndarray = None
-    metadata: np.ndarray = None
-
-    def __init__(self):
-        pass
+    def radec_to_pix(self, ra: np.ndarray, dec: np.ndarray) -> np.ndarray:
+        """Return (N, 2) pixel [x, y] for arrays of RA, Dec in degrees."""
+        ra  = np.asarray(ra,  dtype=float).ravel()
+        dec = np.asarray(dec, dtype=float).ravel()
+        coords = np.vstack([ra, dec, np.ones(len(ra))])  # (3, N)
+        return (self.A @ coords).T                        # (N, 2)
 
 
-class KDTree:
-    root: Node = None
-
-    def __init__(self, data: np.ndarray, metadata: np.ndarray, leaf_size: int=10, use_boxes: bool=False):
-        self.root = build_node(data, metadata, leaf_size, use_boxes)
-
-
-def choose_split_dimension(data) -> int:
-    return np.argmax(np.maximum(data) - np.minimum(data))
-
-
-def partition(
-    data: np.ndarray, 
-    metadata:np.ndarray, 
-    dimension: int
-) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], float]:
-
-    # Find the median value in the splitting dimension
-    median_value = np.median(data[:, dimension])
-
-    # Partition the data into two subsets
-    left_mask = data[:, dimension] <= median_value
-    right_mask = data[:, dimension] > median_value
-
-    left_subset = data[left_mask]
-    right_subset = data[right_mask]
-
-    left_metadata = metadata[left_mask]
-    right_metadata = metadata[right_mask]
-
-    return (left_subset, left_metadata), (right_subset, right_metadata), median_value
+def _fit_wcs(
+    cat_ra: np.ndarray,
+    cat_dec: np.ndarray,
+    pix_x: np.ndarray,
+    pix_y: np.ndarray,
+) -> Optional[WCS]:
+    """
+    Fit a 2D affine WCS from n matched (ra, dec) → (x, y) pairs.
+    Requires n ≥ 3 non-collinear pairs.
+    """
+    n = len(cat_ra)
+    if n < 3:
+        return None
+    M = np.column_stack([cat_ra, cat_dec, np.ones(n)])
+    try:
+        Ax, *_ = np.linalg.lstsq(M, pix_x, rcond=None)
+        Ay, *_ = np.linalg.lstsq(M, pix_y, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    A = np.vstack([Ax, Ay])
+    return WCS(A=A) if np.all(np.isfinite(A)) else None
 
 
-def build_node(data, metadata, leaf_size=10, use_boxes: bool=False) -> Node:
-    # If the set of points is small enough, create a leaf node
-    if len(data) <= leaf_size:
-        return LeafNode(data, metadata)
+# ── Canonical quad ordering ───────────────────────────────────────────────────
 
-    # Split points along the splitting dimension
-    split_dimension = choose_split_dimension(data)
-    (left_data, left_metadata), (right_data, right_metadata), split_position = partition(data, metadata, split_dimension)
+def _sky_abcd(ra: np.ndarray, dec: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Return the canonical [a, b, c, d] index ordering for a 4-star quad
+    in sky (RA/Dec) coordinates, using the same cos(dec)-corrected distance
+    and similarity transform as compute_hash_code.
 
-    if use_boxes:
-        # Create bounding box node
-        n = BoundingBoxNode()
-        n.lower_bounds = np.min(data, axis=0)
-        n.upper_bounds = np.max(data, axis=0)
+    Returns None if C or D lies outside the AB inscribed circle.
+    """
+    ra  = np.asarray(ra,  dtype=float)
+    dec = np.asarray(dec, dtype=float)
 
-    else:
-        n = SplittingNode()
-        n.split_dimension = split_dimension
-        n.split_position = split_position
+    # Pairwise angular distances with cos(dec) correction
+    mean_dec = (dec[:, None] + dec[None, :]) / 2
+    dist = np.sqrt(
+        ((ra[:, None] - ra[None, :]) * np.cos(np.radians(mean_dec))) ** 2
+        + (dec[:, None] - dec[None, :]) ** 2
+    )
+    a, b = np.unravel_index(np.argmax(dist), dist.shape)
+    c, d = [i for i in range(4) if i not in (a, b)]
 
-    n.left_child = build_node(left_data, left_metadata, leaf_size, use_boxes)
-    n.right_child = build_node(right_data, right_metadata, leaf_size, use_boxes)
-    return n
+    # Inscribed-circle validity
+    c_ra  = (ra[a]  + ra[b])  / 2
+    c_dec = (dec[a] + dec[b]) / 2
+    radius = dist[a, b] / 2
+    for idx in (c, d):
+        cd = np.cos(np.radians((dec[idx] + c_dec) / 2))
+        d_star = np.sqrt(((ra[idx] - c_ra) * cd) ** 2 + (dec[idx] - c_dec) ** 2)
+        if d_star >= radius:
+            return None
+
+    # Similarity transform to code space
+    cos_ab = np.cos(np.radians(c_dec))
+    proj   = ra * cos_ab
+    dpr    = proj[b] - proj[a]
+    ddec   = dec[b]  - dec[a]
+    theta  = np.pi / 4 - np.arctan2(ddec, dpr)
+    lam    = np.sqrt(2) / np.sqrt(dpr ** 2 + ddec ** 2)
+    t_x    = lam * (-proj[a] * np.cos(theta) + dec[a] * np.sin(theta))
+    t_y    = lam * (-proj[a] * np.sin(theta) - dec[a] * np.cos(theta))
+    T = np.array([
+        [lam * np.cos(theta), -lam * np.sin(theta), t_x],
+        [lam * np.sin(theta),  lam * np.cos(theta), t_y],
+        [0.,                   0.,                  1. ],
+    ])
+    coords = np.vstack([proj, dec, np.ones(4)])
+    tc     = T @ coords
+
+    xc, xd = tc[0, c], tc[0, d]
+
+    # Canonical C/D ordering
+    if xc > xd:
+        c, d = d, c
+        xc, xd = xd, xc
+
+    # Canonical A/B orientation
+    if xc + xd > 1:
+        a, b = b, a
+        xc, xd = 1.0 - xd, 1.0 - xc
+        if xc > xd:
+            c, d = d, c
+
+    return np.array([a, b, c, d])
+
+
+def _pix_abcd(x: np.ndarray, y: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Return canonical [a, b, c, d] ordering for a 4-star quad in pixel
+    coordinates (Euclidean distances, no cos-dec correction).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist2 = dx ** 2 + dy ** 2
+
+    a, b = np.unravel_index(np.argmax(dist2), dist2.shape)
+    c, d = [i for i in range(4) if i not in (a, b)]
+
+    # Inscribed circle
+    cx, cy = (x[a] + x[b]) / 2, (y[a] + y[b]) / 2
+    r2 = dist2[a, b] / 4
+    if (x[c] - cx) ** 2 + (y[c] - cy) ** 2 >= r2:
+        return None
+    if (x[d] - cx) ** 2 + (y[d] - cy) ** 2 >= r2:
+        return None
+
+    # Similarity transform to code space
+    dab_x  = x[b] - x[a]
+    dab_y  = y[b] - y[a]
+    theta  = np.pi / 4 - np.arctan2(dab_y, dab_x)
+    lam    = np.sqrt(2) / np.sqrt(dab_x ** 2 + dab_y ** 2)
+    t_x    = lam * (-(x[a]) * np.cos(theta) + (y[a]) * np.sin(theta))
+    t_y    = lam * (-(x[a]) * np.sin(theta) - (y[a]) * np.cos(theta))
+    T = np.array([
+        [lam * np.cos(theta), -lam * np.sin(theta), t_x],
+        [lam * np.sin(theta),  lam * np.cos(theta), t_y],
+        [0.,                   0.,                  1. ],
+    ])
+    coords = np.vstack([x, y, np.ones(4)])
+    tc     = T @ coords
+
+    xc, xd = tc[0, c], tc[0, d]
+
+    if xc > xd:
+        c, d = d, c
+        xc, xd = xd, xc
+
+    if xc + xd > 1:
+        a, b = b, a
+        xc, xd = 1.0 - xd, 1.0 - xc
+        if xc > xd:
+            c, d = d, c
+
+    return np.array([a, b, c, d])
+
+
+def _pix_quad_info(
+    x: np.ndarray, y: np.ndarray
+) -> Optional[Tuple[Tuple[float, float, float, float], np.ndarray]]:
+    """
+    Compute pixel-space hash code AND canonical ABCD indices in one consistent pass.
+
+    Running the canonical flip logic once (rather than separately in _pix_hash_code
+    and _pix_abcd) prevents near-boundary quads (xC + xD ≈ 1.0) from getting
+    inconsistent A/B orderings due to floating-point differences between two
+    independent calls.
+
+    Returns
+    -------
+    (code, abcd) where
+        code  : (xc, yc, xd, yd) float tuple — the 4D hash code
+        abcd  : (4,) int array   — canonical [A, B, C, D] indices into x/y
+    or None if the quad is geometrically invalid.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist2 = dx ** 2 + dy ** 2
+
+    a, b = np.unravel_index(np.argmax(dist2), dist2.shape)
+    c, d = [i for i in range(4) if i not in (a, b)]
+
+    cx_mid, cy_mid = (x[a] + x[b]) / 2, (y[a] + y[b]) / 2
+    r2 = dist2[a, b] / 4
+    if (x[c] - cx_mid) ** 2 + (y[c] - cy_mid) ** 2 >= r2:
+        return None
+    if (x[d] - cx_mid) ** 2 + (y[d] - cy_mid) ** 2 >= r2:
+        return None
+
+    dab_x = x[b] - x[a]
+    dab_y = y[b] - y[a]
+    theta = np.pi / 4 - np.arctan2(dab_y, dab_x)
+    lam   = np.sqrt(2) / np.sqrt(dab_x ** 2 + dab_y ** 2)
+    t_x   = lam * (-x[a] * np.cos(theta) + y[a] * np.sin(theta))
+    t_y   = lam * (-x[a] * np.sin(theta) - y[a] * np.cos(theta))
+    T = np.array([
+        [lam * np.cos(theta), -lam * np.sin(theta), t_x],
+        [lam * np.sin(theta),  lam * np.cos(theta), t_y],
+        [0.,                   0.,                  1. ],
+    ])
+    tc = T @ np.vstack([x, y, np.ones(4)])
+
+    xc, yc = tc[0, c], tc[1, c]
+    xd, yd = tc[0, d], tc[1, d]
+
+    # Canonical C/D: ensure xc ≤ xd
+    if xc > xd:
+        c, d = d, c
+        xc, xd = xd, xc
+        yc, yd = yd, yc
+
+    # Canonical A/B orientation: ensure xc + xd ≤ 1 (one consistent check)
+    if xc + xd > 1.0:
+        a, b = b, a
+        xc, xd = 1.0 - xd, 1.0 - xc
+        yc, yd = 1.0 - yd, 1.0 - yc
+        if xc > xd:
+            c, d = d, c
+            xc, xd = xd, xc
+            yc, yd = yd, yc
+
+    return (xc, yc, xd, yd), np.array([a, b, c, d])
+
+
+def _pix_hash_code(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[float, ...]]:
+    """Pixel-space hash code (Euclidean, no cos correction). Delegates to _pix_quad_info."""
+    result = _pix_quad_info(x, y)
+    return result[0] if result is not None else None
+
+
+# ── Coordinate helpers ────────────────────────────────────────────────────────
+
+def _radec_to_xyz(ra_deg: np.ndarray, dec_deg: np.ndarray) -> np.ndarray:
+    """Convert (RA, Dec) in degrees to unit-sphere XYZ. Returns (N, 3)."""
+    ra  = np.radians(np.asarray(ra_deg,  dtype=np.float64))
+    dec = np.radians(np.asarray(dec_deg, dtype=np.float64))
+    cos_dec = np.cos(dec)
+    return np.column_stack([cos_dec * np.cos(ra), cos_dec * np.sin(ra), np.sin(dec)])
+
+
+# ── CodeSpaceTree ─────────────────────────────────────────────────────────────
+
+class CodeSpaceTree:
+    """
+    cKDTree over 4D hash codes (xC, yC, xD, yD) for a single scale tier.
+
+    quad_source_ids[i] holds the four Gaia source IDs of the stars in quad i,
+    stored in canonical ABCD order (matching the ordering of the hash code
+    coordinates). Shape: (N_quads, 4), dtype int64.
+
+    scale_lower_deg / scale_upper_deg record the AB angular diameter range
+    (degrees) covered by this tier so PlateSolver can select the right trees
+    for a given image FOV.
+    """
+
+    def __init__(
+        self,
+        codes: np.ndarray,
+        quad_source_ids: np.ndarray,
+        scale_lower_deg: Optional[float] = None,
+        scale_upper_deg: Optional[float] = None,
+    ) -> None:
+        if codes.ndim != 2 or codes.shape[1] != 4:
+            raise ValueError("codes must be shape (N, 4)")
+        if len(codes) != len(quad_source_ids):
+            raise ValueError("codes and quad_source_ids must have the same length")
+        self.codes           = np.asarray(codes,           dtype=np.float32)
+        self.quad_source_ids = np.asarray(quad_source_ids, dtype=np.int64)
+        self.scale_lower_deg = scale_lower_deg
+        self.scale_upper_deg = scale_upper_deg
+        self._tree           = cKDTree(self.codes)
+
+    def range_search(
+        self, query_code: np.ndarray, radius: float
+    ) -> List[np.ndarray]:
+        """
+        Return all catalogue quad source-ID arrays within `radius` of `query_code`
+        in L2 distance over the 4D code space.
+
+        Parameters
+        ----------
+        query_code : (4,) float  — detected hash code (xC, yC, xD, yD)
+        radius     : float       — search tolerance, typical 0.01–0.05
+
+        Returns
+        -------
+        List of (4,) int64 arrays, one per matching catalogue quad.
+        """
+        q = np.asarray(query_code, dtype=np.float32)
+        indices = self._tree.query_ball_point(q, r=radius)
+        return [self.quad_source_ids[i] for i in indices]
+
+    def save(self, path: str) -> None:
+        """Persist the tree and data arrays. Loads in zero rebuild time via joblib mmap."""
+        joblib.dump(self, path)
+
+    @classmethod
+    def load(cls, path: str) -> "CodeSpaceTree":
+        """Restore from disk. Large arrays are memory-mapped; tree structure is not rebuilt."""
+        return joblib.load(path)
+
+
+# ── StarPositionTree ──────────────────────────────────────────────────────────
+
+class StarPositionTree:
+    """
+    cKDTree over catalogue star positions on the unit sphere (3D XYZ).
+
+    Storing XYZ rather than raw (RA, Dec) means Euclidean distance in the tree
+    is a faithful proxy for angular separation everywhere on the sky, including
+    near the poles where a 2D (RA, Dec) tree has cos(dec) distortion.
+
+    RA/Dec arrays are still kept for box queries and WCS fitting; the cKDTree
+    itself operates on the derived XYZ coordinates.
+    """
+
+    def __init__(
+        self,
+        ra: np.ndarray,
+        dec: np.ndarray,
+        source_ids: np.ndarray,
+        mV: np.ndarray,
+    ) -> None:
+        self.ra         = np.asarray(ra,         dtype=np.float64)
+        self.dec        = np.asarray(dec,        dtype=np.float64)
+        self.source_ids = np.asarray(source_ids, dtype=np.int64)
+        self.mV         = np.asarray(mV,         dtype=np.float64)
+        self._tree      = cKDTree(_radec_to_xyz(self.ra, self.dec))
+
+    def nearest(self, ra: float, dec: float) -> Tuple[int, float]:
+        """Return (source_id, angular_distance_deg) of the nearest catalogue star."""
+        q = _radec_to_xyz(np.array([ra]), np.array([dec]))[0]
+        d_chord, i = self._tree.query(q)
+        # Chord length → central angle: θ = 2·arcsin(chord/2)
+        ang_deg = float(np.degrees(2.0 * np.arcsin(np.clip(d_chord / 2.0, 0.0, 1.0))))
+        return int(self.source_ids[i]), ang_deg
+
+    def stars_in_box(
+        self, ra_min: float, ra_max: float, dec_min: float, dec_max: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Return (ra, dec, mV) arrays for catalogue stars inside the bounding box.
+        """
+        mask = (
+            (self.ra  >= ra_min) & (self.ra  <= ra_max) &
+            (self.dec >= dec_min) & (self.dec <= dec_max)
+        )
+        return self.ra[mask], self.dec[mask], self.mV[mask]
+
+    def save(self, path: str) -> None:
+        """Persist the tree and data arrays. Loads in zero rebuild time via joblib mmap."""
+        joblib.dump(self, path)
+
+    @classmethod
+    def load(cls, path: str) -> "StarPositionTree":
+        """Restore from disk. Large arrays are memory-mapped; tree structure is not rebuilt."""
+        return joblib.load(path)
+
+
+# ── PlateSolver ───────────────────────────────────────────────────────────────
+
+class PlateSolver:
+    """
+    Blind plate solver using geometric hashing and Bayesian verification.
+
+    Accepts one or more CodeSpaceTrees (one per scale tier) and a single
+    StarPositionTree.  At solve time, if fov_deg is provided only the tier(s)
+    whose scale range overlaps the expected FOV are searched, which dramatically
+    reduces false matches compared to searching a single untiered index.
+
+    For each 4-star combo from the detected stars (brightest 20 used):
+      1. Compute a pixel-space hash code.
+      2. Range-search the selected CodeSpaceTrees for matching catalogue quads.
+      3. Match detected ABCD order to catalogue ABCD order.
+      4. Fit an affine WCS from the 4 correspondence pairs.
+      5. Project nearby catalogue stars to pixels under the candidate WCS.
+      6. Accept via bayesian_decision_maker; return the first accepted WCS.
+    """
+
+    def __init__(
+        self,
+        code_trees: "CodeSpaceTree | List[CodeSpaceTree]",
+        star_tree: StarPositionTree,
+        *,
+        code_radius: float = 0.02,
+        max_quads: int = 300,
+        model: str = "asymmetric",
+        variance: float = 9.0,
+        distractors: float = 0.25,
+        field_span_multiplier: float = 4.0,
+    ) -> None:
+        # Accept a single tree or a list for backward compatibility
+        if isinstance(code_trees, CodeSpaceTree):
+            code_trees = [code_trees]
+        self.code_trees  = code_trees
+        self.star_tree   = star_tree
+        self.code_radius = code_radius
+        self.max_quads   = max_quads
+        self.model       = model
+        self.variance    = variance
+        self.distractors = distractors
+        self.field_span  = field_span_multiplier
+
+        # Fast source_id → (ra, dec) lookup
+        self._sid_ra  = dict(zip(star_tree.source_ids, star_tree.ra))
+        self._sid_dec = dict(zip(star_tree.source_ids, star_tree.dec))
+
+    def _select_trees(self, fov_deg: Optional[float]) -> List[CodeSpaceTree]:
+        """
+        Return the subset of code trees relevant for a given FOV.
+
+        A tier is relevant when its scale band overlaps [fov_deg*0.1, fov_deg].
+        A quad's AB pair can span from ~10% of the FOV (tight quad) up to the
+        full FOV diagonal.  When fov_deg is None all trees are searched.
+        """
+        if fov_deg is None:
+            return self.code_trees
+        selected = []
+        for ct in self.code_trees:
+            lo = ct.scale_lower_deg
+            hi = ct.scale_upper_deg
+            if lo is None or hi is None:
+                selected.append(ct)   # no metadata — include unconditionally
+                continue
+            # Overlap condition: tier [lo, hi] ∩ [fov*0.1, fov] ≠ ∅
+            if hi >= fov_deg * 0.1 and lo <= fov_deg:
+                selected.append(ct)
+        return selected or self.code_trees   # fall back to all if nothing matched
+
+    def _resolve_sids(
+        self, source_ids: np.ndarray
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Map source IDs to (ra, dec) arrays. Returns None if any ID is unknown."""
+        try:
+            ra  = np.array([self._sid_ra[s]  for s in source_ids])
+            dec = np.array([self._sid_dec[s] for s in source_ids])
+        except KeyError:
+            return None
+        return ra, dec
+
+    def solve(
+        self,
+        detected_stars: np.ndarray,
+        image_height: int,
+        image_width: int,
+        sort_by: str = "snr",
+        fov_deg: Optional[float] = None,
+    ) -> Optional[WCS]:
+        """
+        Attempt to determine the astrometric solution for a field.
+
+        Parameters
+        ----------
+        detected_stars : (K, 3) array  — [y_pix, x_pix, brightness_metric]
+        image_height, image_width : int
+        sort_by : {"snr", "magnitude"}
+        fov_deg : approximate image field-of-view diagonal in degrees.
+            When provided, only code trees whose scale tier overlaps
+            [fov_deg*0.1, fov_deg] are searched, sharply reducing false
+            matches.  When None all trees are searched.
+
+        Returns
+        -------
+        WCS if a solution is accepted, None otherwise.
+        """
+        stars = np.asarray(detected_stars, dtype=float)
+        if len(stars) < 4:
+            return None
+
+        # Work on the N brightest stars to limit combinations
+        if sort_by == "snr":
+            order = np.argsort(stars[:, 2])[::-1]
+        else:
+            order = np.argsort(stars[:, 2])
+        stars = stars[order[:20]]
+        n = len(stars)
+
+        active_trees = self._select_trees(fov_deg)
+
+        quads_tried = 0
+        for quad_idx in itertools.combinations(range(n), 4):
+            if quads_tried >= self.max_quads:
+                break
+
+            det   = stars[list(quad_idx)]
+            pix_y = det[:, 0]
+            pix_x = det[:, 1]
+
+            # One consistent pass: code and ABCD indices share the same canonical flip
+            quad_info = _pix_quad_info(pix_x, pix_y)
+            if quad_info is None:
+                continue
+
+            query_code, det_abcd = quad_info
+            quads_tried += 1
+            q = np.array(query_code, dtype=np.float32)
+
+            # Search each selected scale tier
+            for code_tree in active_trees:
+                matches = code_tree.range_search(q, radius=self.code_radius)
+
+                for cat_sids in matches:
+                    result = self._resolve_sids(cat_sids)
+                    if result is None:
+                        continue
+                    cat_ra, cat_dec = result
+
+                    # Try both A/B orientations; near xC+xD=1 the sky canonical
+                    # and pixel canonical orderings can disagree due to noise.
+                    det_pix_x = pix_x[det_abcd]
+                    det_pix_y = pix_y[det_abcd]
+                    ab_swap   = np.array([1, 0, 2, 3])
+
+                    wcs = None
+                    best_res2 = np.inf
+                    for c_ra, c_dec in [
+                        (cat_ra, cat_dec),
+                        (cat_ra[ab_swap], cat_dec[ab_swap]),
+                    ]:
+                        w = _fit_wcs(c_ra, c_dec, det_pix_x, det_pix_y)
+                        if w is None:
+                            continue
+                        pred = w.radec_to_pix(c_ra, c_dec)
+                        res2 = ((pred[:, 0] - det_pix_x) ** 2
+                                + (pred[:, 1] - det_pix_y) ** 2).sum()
+                        if res2 < best_res2:
+                            wcs, best_res2 = w, res2
+                    if wcs is None:
+                        continue
+
+                    ra_c  = float(np.mean(cat_ra))
+                    dec_c = float(np.mean(cat_dec))
+                    span  = float(max(np.ptp(cat_ra), np.ptp(cat_dec), 0.05)) * self.field_span
+                    ref_ra, ref_dec, ref_mV = self.star_tree.stars_in_box(
+                        ra_c - span, ra_c + span, dec_c - span, dec_c + span
+                    )
+                    if len(ref_ra) == 0:
+                        continue
+
+                    ref_pix   = wcs.radec_to_pix(ref_ra, ref_dec)
+                    ref_stars = np.column_stack([
+                        ref_pix[:, 1], ref_pix[:, 0], ref_mV,
+                    ])
+
+                    if bayesian_decision_maker(
+                        reference_stars=ref_stars,
+                        test_stars=stars,
+                        image_height=image_height,
+                        image_width=image_width,
+                        model=self.model,
+                        variance=self.variance,
+                        distractors=self.distractors,
+                        sort_by=sort_by,
+                    ):
+                        return wcs
+
+        return None
+
+
+# ── Index builder ─────────────────────────────────────────────────────────────
+
+def _generate_indexed_features(
+    star_ra: np.ndarray,
+    star_dec: np.ndarray,
+    star_mv: np.ndarray,
+    source_ids: np.ndarray,
+    grid_ra: Tuple[float, float],
+    grid_dec: Tuple[float, float],
+    max_times_used: int = 8,
+    scale_lower_deg: Optional[float] = None,
+    scale_upper_deg: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate quad hash codes and their ABCD-ordered source ID arrays.
+
+    Only quads whose AB angular diameter falls within
+    [scale_lower_deg, scale_upper_deg] are included.  When either bound is
+    None the corresponding check is skipped (no filtering on that side).
+
+    Returns
+    -------
+    codes           : (M, 4) float32 — hash codes for valid quads
+    quad_source_ids : (M, 4) int64   — Gaia source IDs in canonical ABCD order
+    """
+    star_ra    = np.asarray(star_ra,    dtype=float)
+    star_dec   = np.asarray(star_dec,   dtype=float)
+    star_mv    = np.asarray(star_mv,    dtype=float)
+    source_ids = np.asarray(source_ids, dtype=np.int64)
+
+    order      = np.argsort(star_mv)
+    star_ra    = star_ra[order]
+    star_dec   = star_dec[order]
+    source_ids = source_ids[order]
+
+    times_used = np.zeros(len(star_ra), dtype=int)
+    codes_out: List[Tuple] = []
+    sids_out:  List[List]  = []
+
+    for quad in itertools.combinations(range(len(star_ra)), 4):
+        if any(times_used[i] >= max_times_used for i in quad):
+            continue
+
+        q_ra  = star_ra[list(quad)]
+        q_dec = star_dec[list(quad)]
+
+        if not (grid_ra[0]  <= np.mean(q_ra)  <= grid_ra[1] and
+                grid_dec[0] <= np.mean(q_dec) <= grid_dec[1]):
+            continue
+
+        # Scale filter: check AB separation before the more expensive hash
+        if scale_lower_deg is not None or scale_upper_deg is not None:
+            sep = _ab_sep_deg(q_ra, q_dec)
+            if scale_lower_deg is not None and sep < scale_lower_deg:
+                continue
+            if scale_upper_deg is not None and sep > scale_upper_deg:
+                continue
+
+        code = compute_hash_code(q_ra, q_dec)
+        if code is None:
+            continue
+
+        abcd = _sky_abcd(q_ra, q_dec)
+        if abcd is None:
+            continue
+
+        ordered_sids = [source_ids[quad[abcd[k]]] for k in range(4)]
+        codes_out.append(code)
+        sids_out.append(ordered_sids)
+        for i in quad:
+            times_used[i] += 1
+
+    if codes_out:
+        return (
+            np.array(codes_out, dtype=np.float32),
+            np.array(sids_out,  dtype=np.int64),
+        )
+    return np.empty((0, 4), dtype=np.float32), np.empty((0, 4), dtype=np.int64)
+
+
+def build_index(
+    sky_region: dict,
+    grid_size: Tuple[float, float],
+    code_index_path: str,
+    star_index_path: str,
+    catalog_name: str = "Gaia",
+    row_limit: int = 1000,
+    max_times_used: int = 8,
+    scale_lower_deg: Optional[float] = None,
+    scale_upper_deg: Optional[float] = None,
+) -> Tuple[CodeSpaceTree, StarPositionTree]:
+    """
+    Build and persist the code-space and star-position indices for a sky region.
+
+    Parameters
+    ----------
+    sky_region       : dict — keys: min_ra, max_ra, min_dec, max_dec (degrees)
+    grid_size        : (ra_size_deg, dec_size_deg) per grid cell
+    code_index_path  : output path for CodeSpaceTree  (.joblib)
+    star_index_path  : output path for StarPositionTree (.joblib)
+    scale_lower_deg  : only include quads with AB separation ≥ this (degrees)
+    scale_upper_deg  : only include quads with AB separation ≤ this (degrees)
+
+    Returns
+    -------
+    (CodeSpaceTree, StarPositionTree)
+    """
+    min_ra,  max_ra  = sky_region["min_ra"],  sky_region["max_ra"]
+    min_dec, max_dec = sky_region["min_dec"], sky_region["max_dec"]
+    ra_size, dec_size = grid_size
+
+    ra_steps  = max(1, int((max_ra  - min_ra)  / ra_size))
+    dec_steps = max(1, int((max_dec - min_dec) / dec_size))
+
+    all_codes:    List[np.ndarray] = []
+    all_quad_ids: List[np.ndarray] = []
+    all_ra:       List[float]      = []
+    all_dec:      List[float]      = []
+    all_src_ids:  List[int]        = []
+    all_mV:       List[float]      = []
+    seen_src_ids: set              = set()
+
+    from astrometry.catalog_queries import query_catalog  # deferred to avoid astroquery at import time
+
+    print(f"[build_index] {ra_steps}×{dec_steps} grid over "
+          f"RA [{min_ra}, {max_ra}]  Dec [{min_dec}, {max_dec}]")
+
+    for i in range(ra_steps):
+        for j in range(dec_steps):
+            cell_ra_min  = min_ra  + i * ra_size
+            cell_dec_min = min_dec + j * dec_size
+
+            # Query 3×3 neighbourhood to avoid edge effects
+            search_ra_min  = np.clip(min_ra  + (i - 1) * ra_size,  0.0,  360.0)
+            search_ra_max  = np.clip(min_ra  + (i + 2) * ra_size,  0.0,  360.0)
+            search_dec_min = np.clip(min_dec + (j - 1) * dec_size, -90.0,  90.0)
+            search_dec_max = np.clip(min_dec + (j + 2) * dec_size, -90.0,  90.0)
+
+            center_ra  = (search_ra_min  + search_ra_max)  / 2
+            center_dec = (search_dec_min + search_dec_max) / 2
+
+            try:
+                stars = query_catalog(
+                    catalog_name, center_ra, center_dec,
+                    fov_width  = search_ra_max  - search_ra_min,
+                    fov_height = search_dec_max - search_dec_min,
+                    row_limit=row_limit,
+                )
+            except Exception as exc:
+                print(f"  cell ({i},{j}): catalog query failed — {exc}")
+                continue
+
+            s_ra   = np.asarray(stars["ra"],        dtype=float)
+            s_dec  = np.asarray(stars["dec"],       dtype=float)
+            s_mV   = np.asarray(stars["mV"],        dtype=float)
+            s_sids = np.asarray(stars["source_id"], dtype=np.int64)
+
+            codes, quad_sids = _generate_indexed_features(
+                s_ra, s_dec, s_mV, s_sids,
+                grid_ra =(cell_ra_min,  cell_ra_min  + ra_size),
+                grid_dec=(cell_dec_min, cell_dec_min + dec_size),
+                max_times_used=max_times_used,
+                scale_lower_deg=scale_lower_deg,
+                scale_upper_deg=scale_upper_deg,
+            )
+
+            if len(codes):
+                all_codes.append(codes)
+                all_quad_ids.append(quad_sids)
+
+            # Accumulate unique catalogue stars for the position tree
+            new_mask = np.array([sid not in seen_src_ids for sid in s_sids])
+            if new_mask.any():
+                all_ra.extend(s_ra[new_mask].tolist())
+                all_dec.extend(s_dec[new_mask].tolist())
+                all_src_ids.extend(s_sids[new_mask].tolist())
+                all_mV.extend(s_mV[new_mask].tolist())
+                seen_src_ids.update(int(s) for s in s_sids[new_mask])
+
+            print(f"  cell ({i:2d},{j:2d}): {len(s_ra):4d} stars  "
+                  f"{len(codes):5d} codes")
+
+    if not all_codes:
+        raise RuntimeError(
+            "No hash codes generated. Check sky region bounds and catalog access."
+        )
+
+    codes_arr    = np.vstack(all_codes)
+    quad_ids_arr = np.vstack(all_quad_ids)
+    ra_arr       = np.array(all_ra,      dtype=np.float64)
+    dec_arr      = np.array(all_dec,     dtype=np.float64)
+    src_ids_arr  = np.array(all_src_ids, dtype=np.int64)
+    mV_arr       = np.array(all_mV,      dtype=np.float64)
+
+    code_tree = CodeSpaceTree(
+        codes_arr, quad_ids_arr,
+        scale_lower_deg=scale_lower_deg,
+        scale_upper_deg=scale_upper_deg,
+    )
+    star_tree = StarPositionTree(ra_arr, dec_arr, src_ids_arr, mV_arr)
+
+    Path(code_index_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(star_index_path).parent.mkdir(parents=True, exist_ok=True)
+    code_tree.save(code_index_path)
+    star_tree.save(star_index_path)
+
+    print(f"\n[build_index] wrote {len(codes_arr):,} codes  → {code_index_path}")
+    print(f"[build_index] wrote {len(ra_arr):,} stars   → {star_index_path}")
+
+    return code_tree, star_tree
+
+
+def build_index_tiered(
+    sky_region: dict,
+    tier_indices: List[int],
+    index_dir: str,
+    star_index_path: str,
+    grid_size: Tuple[float, float] = (2.0, 2.0),
+    catalog_name: str = "Gaia",
+    row_limit: int = 500,
+    max_times_used: int = 8,
+) -> Tuple[List[CodeSpaceTree], StarPositionTree]:
+    """
+    Build one CodeSpaceTree per scale tier for a sky region.
+
+    The star-position index is built once from the first tier's catalog queries
+    and reused for all subsequent tiers (stars are tier-independent).
+
+    Parameters
+    ----------
+    sky_region    : dict — min_ra, max_ra, min_dec, max_dec (degrees)
+    tier_indices  : list of ints into SCALE_TIERS (e.g. [8, 9, 10, 11])
+    index_dir     : directory to write per-tier code index files
+    star_index_path : path for the shared StarPositionTree
+    grid_size     : (ra_deg, dec_deg) per grid cell
+    catalog_name  : "Gaia" or other supported catalog
+    row_limit     : max stars per catalog query
+    max_times_used: max quads per star per tier
+
+    Returns
+    -------
+    (list of CodeSpaceTree, StarPositionTree)
+    """
+    Path(index_dir).mkdir(parents=True, exist_ok=True)
+
+    code_trees: List[CodeSpaceTree] = []
+    star_tree: Optional[StarPositionTree] = None
+
+    for tier in tier_indices:
+        if tier not in SCALE_TIERS:
+            raise ValueError(f"Tier {tier} not in SCALE_TIERS (valid: 0–15)")
+        lo, hi = SCALE_TIERS[tier]
+        code_path = str(Path(index_dir) / f"codes_tier{tier:02d}.joblib")
+
+        print(f"\n── Tier {tier}  ({lo:.3f}° – {hi:.3f}° AB diameter) ──")
+        ct, st = build_index(
+            sky_region=sky_region,
+            grid_size=grid_size,
+            code_index_path=code_path,
+            star_index_path=star_index_path,
+            catalog_name=catalog_name,
+            row_limit=row_limit,
+            max_times_used=max_times_used,
+            scale_lower_deg=lo,
+            scale_upper_deg=hi,
+        )
+        code_trees.append(ct)
+        if star_tree is None:
+            star_tree = st
+
+    return code_trees, star_tree
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="python -m astrometry.kd_tree",
+        description="Build or query the astrometric hash-code index.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ---- build ---------------------------------------------------------------
+    p_build = sub.add_parser(
+        "build",
+        help="Build a single-tier or multi-tier index for a sky region.",
+    )
+    p_build.add_argument("--min_ra",  type=float, required=True)
+    p_build.add_argument("--max_ra",  type=float, required=True)
+    p_build.add_argument("--min_dec", type=float, required=True)
+    p_build.add_argument("--max_dec", type=float, required=True)
+    p_build.add_argument("--grid_ra",  type=float, default=2.0,
+                         help="Grid RA cell size (deg, default 2.0).")
+    p_build.add_argument("--grid_dec", type=float, default=2.0,
+                         help="Grid Dec cell size (deg, default 2.0).")
+    p_build.add_argument("--tiers", type=int, nargs="+", default=None,
+                         help="Scale tier indices to build (e.g. --tiers 8 9 10 11). "
+                              "If omitted, builds a single untiered index.")
+    p_build.add_argument("--index_dir", type=str, default="indices/",
+                         help="Output directory for tiered builds (default: indices/).")
+    p_build.add_argument("--code_index", type=str, default="index_codes.joblib",
+                         help="Output path for single-tier CodeSpaceTree.")
+    p_build.add_argument("--star_index", type=str, default="index_stars.joblib",
+                         help="Output path for StarPositionTree.")
+    p_build.add_argument("--catalog",   type=str, default="Gaia")
+    p_build.add_argument("--row_limit", type=int, default=500,
+                         help="Stars per catalog query (default 500).")
+    p_build.add_argument("--max_times_used", type=int, default=8,
+                         help="Max quads per star (default 8).")
+    p_build.add_argument("--scale_lower", type=float, default=None,
+                         help="Min AB separation for single-tier build (deg).")
+    p_build.add_argument("--scale_upper", type=float, default=None,
+                         help="Max AB separation for single-tier build (deg).")
+
+    # ---- query ---------------------------------------------------------------
+    p_query = sub.add_parser(
+        "query", help="Range-search a saved CodeSpaceTree with a hash code."
+    )
+    p_query.add_argument("--code_index", type=str, required=True)
+    p_query.add_argument("--code", type=float, nargs=4, required=True,
+                         metavar=("XC", "YC", "XD", "YD"))
+    p_query.add_argument("--radius", type=float, default=0.02)
+
+    # ---- info ----------------------------------------------------------------
+    p_info = sub.add_parser("info", help="Print summary of a saved index.")
+    p_info.add_argument("--code_index", type=str, default=None)
+    p_info.add_argument("--star_index", type=str, default=None)
+
+    args = parser.parse_args()
+
+    if args.command == "build":
+        region = dict(
+            min_ra=args.min_ra,  max_ra=args.max_ra,
+            min_dec=args.min_dec, max_dec=args.max_dec,
+        )
+        if args.tiers:
+            build_index_tiered(
+                sky_region=region,
+                tier_indices=args.tiers,
+                index_dir=args.index_dir,
+                star_index_path=args.star_index,
+                grid_size=(args.grid_ra, args.grid_dec),
+                catalog_name=args.catalog,
+                row_limit=args.row_limit,
+                max_times_used=args.max_times_used,
+            )
+        else:
+            build_index(
+                sky_region=region,
+                grid_size=(args.grid_ra, args.grid_dec),
+                code_index_path=args.code_index,
+                star_index_path=args.star_index,
+                catalog_name=args.catalog,
+                row_limit=args.row_limit,
+                max_times_used=args.max_times_used,
+                scale_lower_deg=args.scale_lower,
+                scale_upper_deg=args.scale_upper,
+            )
+
+    elif args.command == "query":
+        tree = CodeSpaceTree.load(args.code_index)
+        q    = np.array(args.code, dtype=np.float32)
+        hits = tree.range_search(q, radius=args.radius)
+        print(f"Query code  : {q.tolist()}")
+        print(f"Radius      : {args.radius}")
+        print(f"Index size  : {len(tree.codes):,} quads")
+        print(f"Matches     : {len(hits)}")
+        for k, sids in enumerate(hits[:20]):
+            print(f"  [{k:3d}]  source_ids = {sids.tolist()}")
+        if len(hits) > 20:
+            print(f"  ... and {len(hits) - 20} more")
+
+    elif args.command == "info":
+        if args.code_index:
+            t = CodeSpaceTree.load(args.code_index)
+            print(f"CodeSpaceTree  : {args.code_index}")
+            print(f"  quads        : {len(t.codes):,}")
+            print(f"  code range   : min={t.codes.min():.4f}  max={t.codes.max():.4f}")
+        if args.star_index:
+            s = StarPositionTree.load(args.star_index)
+            print(f"StarPositionTree : {args.star_index}")
+            print(f"  stars          : {len(s.ra):,}")
+            print(f"  RA range       : [{s.ra.min():.2f}, {s.ra.max():.2f}] deg")
+            print(f"  Dec range      : [{s.dec.min():.2f}, {s.dec.max():.2f}] deg")

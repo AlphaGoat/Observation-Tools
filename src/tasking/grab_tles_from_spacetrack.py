@@ -4,40 +4,76 @@ Utilities for grabbing TLEs from Space-Track.org
 Author: Peter Thomas
 Date: 2025-10-12
 """
-import urllib.parse
+import os
+import json
+import getpass
+import argparse
+import requests
+from typing import Optional
 
 
-def get_latest_tles(username: str, password: str, catalog: str = "active", format: str = "tle", limit: int=100) -> str:
+# Maps the catalog argument to the Space-Track GP class and predicate string.
+# "active" - most recent TLE for every currently tracked object
+# "visual"  - same, but filtered to payloads only (most likely optically observable)
+# "all"     - most recent TLE for all objects including debris and rocket bodies
+_CATALOG_QUERY_MAP = {
+    "active": "class/gp/CURRENT/Y",
+    "visual": "class/gp/CURRENT/Y/OBJECT_TYPE/PAYLOAD",
+    "all":    "class/gp",
+}
+
+
+def _get_credentials(username: Optional[str], password: Optional[str]):
+    """
+    Resolve Space-Track credentials using a priority-ordered fallback:
+      1. Explicit arguments passed by the caller
+      2. Environment variables SPACETRACK_USER and SPACETRACK_PASS
+      3. Interactive getpass prompts (password is never echoed)
+    """
+    username = username or os.environ.get("SPACETRACK_USER") or input("Space-Track username: ")
+    password = password or os.environ.get("SPACETRACK_PASS") or getpass.getpass("Space-Track password: ")
+    return username, password
+
+
+def get_latest_tles(username: Optional[str] = None, password: Optional[str] = None,
+                    catalog: str = "active",
+                    fmt: str = "tle", limit: int = 100) -> str:
     """
     Get the latest TLEs from Space-Track.org
 
     Parameters:
-    username (str): Space-Track.org username
-    password (str): Space-Track.org password
-    catalog (str): Catalog to query. Options are "active", "historical", "all", or "visual". Default is "active".
-    format (str): Format of the returned data. Options are "tle" or "json". Default is "tle".
+    username (str): Space-Track.org username.
+    password (str): Space-Track.org password.
+    catalog (str): Catalog to query. Options are "active", "visual", or "all". Default is "active".
+    fmt (str): Format of the returned data. Options are "tle" or "json". Default is "tle".
+    limit (int): Maximum number of records to return.
 
     Returns:
-    str: TLE data as a string
+    str: TLE data as a string.
     """
-    import requests
+    if catalog not in _CATALOG_QUERY_MAP:
+        raise ValueError(f"Unknown catalog '{catalog}'. Choose from: {list(_CATALOG_QUERY_MAP.keys())}")
+
+    username, password = _get_credentials(username, password)
 
     base_url = "https://www.space-track.org"
     login_url = f"{base_url}/ajaxauth/login"
 
-    # Start a session to persist cookies
     with requests.Session() as session:
-
-        # Login to Space-Track.org
-        login_payload = {
-            'identity': username,
-            'password': password,
-        }
-        response = session.post(login_url, data=login_payload)
+        response = session.post(login_url, data={"identity": username, "password": password})
         response.raise_for_status()
+        if "Failed" in response.text or "Invalid" in response.text:
+            raise RuntimeError("Space-Track authentication failed — check credentials.")
 
-        # Fetch the TLE data
-        query = urllib.parse.urljoin(base_url, urllib.parse.quote(f'/basicspacedata/query/class/tle_latest/orderby/NORAD_CAT_ID asc/limit/{limit}/format/{format}/emptyresult/show'))
+        class_predicates = _CATALOG_QUERY_MAP[catalog]
+        query = (
+            f"{base_url}/basicspacedata/query"
+            f"/{class_predicates}"
+            f"/orderby/NORAD_CAT_ID asc"
+            f"/limit/{limit}"
+            f"/format/{fmt}"
+            f"/emptyresult/show"
+        )
         response = session.get(query)
         response.raise_for_status()
 
@@ -45,26 +81,24 @@ def get_latest_tles(username: str, password: str, catalog: str = "active", forma
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Fetch latest TLEs from Space-Track.org")
-    parser.add_argument('--username', type=str, required=True, help='Space-Track.org username')
-    parser.add_argument('--password', type=str, required=True, help='Space-Track.org password')
-    parser.add_argument('--catalog', type=str, default='active', choices=['active', 'historical', 'all', 'visual'], help='Catalog to query')
-    parser.add_argument('--format', type=str, default='tle', choices=['tle', 'json'], help='Format of the returned data')
+    parser.add_argument("--catalog", type=str, default="active", choices=list(_CATALOG_QUERY_MAP.keys()),
+                        help="Catalog to query")
+    parser.add_argument("--format", type=str, default="tle", choices=["tle", "json"],
+                        help="Format of the returned data")
     parser.add_argument("--limit", type=int, default=100, help="Number of TLEs to fetch")
-    parser.add_argument('--output', type=str, default='tles.txt', help='Output file to save TLE data')
-
+    parser.add_argument("--output", type=str, default="tles.txt", help="Output file to save TLE data")
     args = parser.parse_args()
 
-    tle_data = get_latest_tles(args.username, args.password, args.catalog, args.format, args.limit)
+    tle_data = get_latest_tles(username=None, password=None, 
+                               catalog=args.catalog, fmt=args.format, 
+                               limit=args.limit)
+
     if args.format == "json":
-        import json
-        tle_json = json.loads(tle_data)
-        with open(args.output, 'w') as f:
-            json.dump(tle_json, f, indent=4)
+        with open(args.output, "w") as f:
+            json.dump(json.loads(tle_data), f, indent=4)
     else:
-        with open(args.output, 'w') as f:
+        with open(args.output, "w") as f:
             f.write(tle_data)
 
     print(f"TLE data saved to {args.output}")
