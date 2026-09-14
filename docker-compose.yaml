@@ -1,0 +1,218 @@
+# docker-compose.yaml — runs the full observation pipeline locally without Kubernetes.
+#
+# Quick start
+# -----------
+#   docker compose build
+#   docker compose up
+#   curl http://localhost:8080/health
+#
+# To pass index files to the plate solver, place them in ./indices/ before starting.
+# The directory is bind-mounted read-only at /indices inside the plate-solver container.
+#
+# Environment overrides can be placed in a .env file at the project root.
+
+name: observation-tools
+
+# ── Shared config ─────────────────────────────────────────────────────────────
+x-extractor-base: &extractor-base
+  build:
+    context: .
+    dockerfile: src/source_extraction/Dockerfile
+  restart: unless-stopped
+  networks:
+    - obs-net
+
+x-resource-limits: &small-limits
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: 512M
+
+x-resource-limits-medium: &medium-limits
+  deploy:
+    resources:
+      limits:
+        cpus: "2"
+        memory: 2G
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # --------------------------------------------------------------------------
+  # Star extractor (rate-track mode: stars appear as streaks)
+  # --------------------------------------------------------------------------
+  star-extractor:
+    <<: *extractor-base
+    container_name: star-extractor
+    environment:
+      EXTRACTOR_TYPE: stars
+      PORT: "5002"
+      WORKERS: "2"
+    ports:
+      - "5102:5002"       # host 5102 → container 5002 (avoid clash with satellite-extractor)
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    <<: *medium-limits
+
+  # --------------------------------------------------------------------------
+  # Satellite extractor (rate-track mode: satellites appear as point sources)
+  # --------------------------------------------------------------------------
+  satellite-extractor:
+    <<: *extractor-base
+    container_name: satellite-extractor
+    environment:
+      EXTRACTOR_TYPE: satellites
+      PORT: "5002"
+      WORKERS: "2"
+    ports:
+      - "5202:5002"       # host 5202 → container 5002
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    <<: *medium-limits
+
+  # --------------------------------------------------------------------------
+  # Plate solver (astrometry)
+  # --------------------------------------------------------------------------
+  plate-solver:
+    build:
+      context: .
+      dockerfile: src/astrometry/Dockerfile
+    container_name: plate-solver
+    environment:
+      PORT: "5000"
+      WORKERS: "2"
+      INDEX_DIR: /indices
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./indices:/indices:ro    # pre-built CodeSpaceTree + StarPositionTree files
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - obs-net
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 6G
+
+  # --------------------------------------------------------------------------
+  # Projector (pixel → RA/Dec via gnomonic WCS)
+  # --------------------------------------------------------------------------
+  projector:
+    build:
+      context: .
+      dockerfile: src/obs/Dockerfile
+    container_name: projector
+    environment:
+      PORT: "5003"
+      WORKERS: "4"
+    ports:
+      - "5003:5003"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5003/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - obs-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # --------------------------------------------------------------------------
+  # Associator (MHT track association)
+  # --------------------------------------------------------------------------
+  associator:
+    build:
+      context: .
+      dockerfile: src/associator/Dockerfile
+    container_name: associator
+    environment:
+      PORT: "5001"
+      WORKERS: "4"
+    ports:
+      - "5001:5001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - obs-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1G
+
+  # --------------------------------------------------------------------------
+  # Pipeline coordinator (external entry point)
+  # --------------------------------------------------------------------------
+  pipeline-coordinator:
+    build:
+      context: .
+      dockerfile: src/pipeline/Dockerfile
+    container_name: pipeline-coordinator
+    environment:
+      PORT: "8080"
+      WORKERS: "4"
+      TIMEOUT: "600"
+      STAR_EXTRACTOR_URL: "http://star-extractor:5002"
+      SATELLITE_EXTRACTOR_URL: "http://satellite-extractor:5002"
+      PLATE_SOLVER_URL: "http://plate-solver:5000"
+      PROJECTOR_URL: "http://projector:5003"
+      ASSOCIATOR_URL: "http://associator:5001"
+      MAX_FRAME_WORKERS: "8"
+    ports:
+      - "8080:8080"
+    depends_on:
+      star-extractor:
+        condition: service_healthy
+      satellite-extractor:
+        condition: service_healthy
+      plate-solver:
+        condition: service_healthy
+      projector:
+        condition: service_healthy
+      associator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - obs-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  obs-net:
+    driver: bridge

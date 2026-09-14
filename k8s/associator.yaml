@@ -1,0 +1,71 @@
+# MHT track associator — stateless batch service.
+# Each request is one complete observation set; no session state between requests.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: associator
+  namespace: observation-tools
+  labels:
+    app: associator
+    app.kubernetes.io/part-of: observation-tools
+    app.kubernetes.io/component: track-association
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: associator
+  template:
+    metadata:
+      labels:
+        app: associator
+    spec:
+      containers:
+        - name: associator
+          image: observation-tools/associator:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5001
+          env:
+            - name: PORT
+              value: "5001"
+            - name: WORKERS
+              value: "4"
+            - name: TIMEOUT
+              value: "120"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 8
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: associator
+  namespace: observation-tools
+  labels:
+    app: associator
+    app.kubernetes.io/part-of: observation-tools
+spec:
+  selector:
+    app: associator
+  ports:
+    - name: http
+      port: 5001
+      targetPort: 5001
+  type: ClusterIP

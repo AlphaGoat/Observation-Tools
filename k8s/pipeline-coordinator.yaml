@@ -1,0 +1,88 @@
+# Pipeline coordinator — the single entry point for a client.
+# Exposed as NodePort so minikube can route external traffic to it.
+# In production replace NodePort with an Ingress + ClusterIP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-coordinator
+  namespace: observation-tools
+  labels:
+    app: pipeline-coordinator
+    app.kubernetes.io/part-of: observation-tools
+    app.kubernetes.io/component: orchestration
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pipeline-coordinator
+  template:
+    metadata:
+      labels:
+        app: pipeline-coordinator
+    spec:
+      containers:
+        - name: pipeline-coordinator
+          image: observation-tools/pipeline-coordinator:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: WORKERS
+              value: "4"
+            - name: TIMEOUT
+              value: "600"
+            - name: STAR_EXTRACTOR_URL
+              value: "http://star-extractor:5002"
+            - name: SATELLITE_EXTRACTOR_URL
+              value: "http://satellite-extractor:5002"
+            - name: PLATE_SOLVER_URL
+              value: "http://plate-solver:5000"
+            - name: PROJECTOR_URL
+              value: "http://projector:5003"
+            - name: ASSOCIATOR_URL
+              value: "http://associator:5001"
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pipeline-coordinator
+  namespace: observation-tools
+  labels:
+    app: pipeline-coordinator
+    app.kubernetes.io/part-of: observation-tools
+spec:
+  selector:
+    app: pipeline-coordinator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      # nodePort is assigned automatically in the range 30000-32767.
+      # Run `minikube service pipeline-coordinator -n observation-tools --url`
+      # to get the externally-reachable URL after deployment.
+  type: NodePort

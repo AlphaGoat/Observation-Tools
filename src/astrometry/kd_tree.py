@@ -80,22 +80,85 @@ def _ab_sep_deg(ra: np.ndarray, dec: np.ndarray) -> float:
     return float(dist.max())
 
 
+def _sep2_deg(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Angular separation (degrees) between two sky positions (flat-sky approx)."""
+    mean_dec_rad = np.radians((dec1 + dec2) / 2)
+    return float(np.sqrt(
+        ((ra1 - ra2) * np.cos(mean_dec_rad)) ** 2 + (dec1 - dec2) ** 2
+    ))
+
+
+def _gnomonic(
+    ra: np.ndarray, dec: np.ndarray, ra0: float, dec0: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Gnomonic (TAN) projection: (RA, Dec) → tangent-plane (ξ, η) in degrees.
+
+    Tangent point is (ra0, dec0).  Returns (xi_deg, eta_deg).
+    Valid for separations up to ~60° from the tangent point; the plate solver
+    uses it for FOVs up to ~10° where it is essentially exact.
+    """
+    ra_r  = np.radians(np.asarray(ra,  dtype=np.float64))
+    dec_r = np.radians(np.asarray(dec, dtype=np.float64))
+    r0 = np.radians(ra0)
+    d0 = np.radians(dec0)
+    cos_c = (np.sin(d0) * np.sin(dec_r)
+             + np.cos(d0) * np.cos(dec_r) * np.cos(ra_r - r0))
+    xi  = -np.cos(dec_r) * np.sin(ra_r - r0) / cos_c
+    eta = (np.cos(d0) * np.sin(dec_r)
+           - np.sin(d0) * np.cos(dec_r) * np.cos(ra_r - r0)) / cos_c
+    return np.degrees(xi), np.degrees(eta)
+
+
+def _gnomonic_inv(
+    xi_deg: np.ndarray, eta_deg: np.ndarray, ra0: float, dec0: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Inverse gnomonic: tangent-plane (ξ, η) in degrees → (RA, Dec) in degrees.
+    """
+    xi  = np.radians(np.asarray(xi_deg,  dtype=np.float64))
+    eta = np.radians(np.asarray(eta_deg, dtype=np.float64))
+    r0 = np.radians(ra0)
+    d0 = np.radians(dec0)
+    D   = np.cos(d0) - eta * np.sin(d0)
+    ra  = r0 + np.arctan2(-xi, D)
+    dec = np.arctan2(np.sin(d0) + eta * np.cos(d0), np.sqrt(xi ** 2 + D ** 2))
+    return np.degrees(ra) % 360.0, np.degrees(dec)
+
+
 # ── WCS ──────────────────────────────────────────────────────────────────────
 
 @dataclass
 class WCS:
     """
-    Affine WCS: [x_pix, y_pix]ᵀ = A @ [ra_deg, dec_deg, 1]ᵀ
-    A is shape (2, 3), float64.
+    Gnomonic (TAN) WCS.
+
+    Forward:  pixel = A @ [ξ, η, 1]ᵀ
+    where (ξ, η) are gnomonic tangent-plane coordinates in degrees, projected
+    from the tangent point (ra0, dec0).  A is shape (2, 3), float64.
+
+    Backward: (ξ, η) = A[:,:2]⁻¹ @ (pixel − A[:,2])  then gnomonic⁻¹
     """
-    A: np.ndarray
+    A:    np.ndarray
+    ra0:  float = 0.0
+    dec0: float = 0.0
 
     def radec_to_pix(self, ra: np.ndarray, dec: np.ndarray) -> np.ndarray:
         """Return (N, 2) pixel [x, y] for arrays of RA, Dec in degrees."""
         ra  = np.asarray(ra,  dtype=float).ravel()
         dec = np.asarray(dec, dtype=float).ravel()
-        coords = np.vstack([ra, dec, np.ones(len(ra))])  # (3, N)
-        return (self.A @ coords).T                        # (N, 2)
+        xi, eta = _gnomonic(ra, dec, self.ra0, self.dec0)
+        coords  = np.vstack([xi, eta, np.ones(len(xi))])   # (3, N)
+        return (self.A @ coords).T                           # (N, 2)
+
+    def pix_to_radec(self, x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (ra_deg, dec_deg) arrays for pixel coordinates (0-indexed)."""
+        x = np.asarray(x, dtype=float).ravel()
+        y = np.asarray(y, dtype=float).ravel()
+        M_inv = np.linalg.inv(self.A[:, :2])
+        t     = self.A[:, 2]
+        xi_eta = M_inv @ np.vstack([x - t[0], y - t[1]])   # (2, N) tangent-plane
+        return _gnomonic_inv(xi_eta[0], xi_eta[1], self.ra0, self.dec0)
 
 
 def _fit_wcs(
@@ -105,20 +168,26 @@ def _fit_wcs(
     pix_y: np.ndarray,
 ) -> Optional[WCS]:
     """
-    Fit a 2D affine WCS from n matched (ra, dec) → (x, y) pairs.
+    Fit a gnomonic WCS from n matched (ra, dec) → (x, y) pairs.
+
+    Sets the tangent point at the centroid of the catalogue stars, projects
+    them to (ξ, η), then fits [x, y]ᵀ = A @ [ξ, η, 1]ᵀ with least squares.
     Requires n ≥ 3 non-collinear pairs.
     """
     n = len(cat_ra)
     if n < 3:
         return None
-    M = np.column_stack([cat_ra, cat_dec, np.ones(n)])
+    ra0  = float(np.mean(cat_ra))
+    dec0 = float(np.mean(cat_dec))
+    xi, eta = _gnomonic(cat_ra, cat_dec, ra0, dec0)
+    M = np.column_stack([xi, eta, np.ones(n)])
     try:
         Ax, *_ = np.linalg.lstsq(M, pix_x, rcond=None)
         Ay, *_ = np.linalg.lstsq(M, pix_y, rcond=None)
     except np.linalg.LinAlgError:
         return None
     A = np.vstack([Ax, Ay])
-    return WCS(A=A) if np.all(np.isfinite(A)) else None
+    return WCS(A=A, ra0=ra0, dec0=dec0) if np.all(np.isfinite(A)) else None
 
 
 # ── Canonical quad ordering ───────────────────────────────────────────────────
@@ -659,63 +728,123 @@ def _generate_indexed_features(
     scale_upper_deg: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Generate quad hash codes and their ABCD-ordered source ID arrays.
+    Grid-driven quad enumeration — O(n · k_AB · k_CD²) vs the previous O(n⁴/24).
 
-    Only quads whose AB angular diameter falls within
-    [scale_lower_deg, scale_upper_deg] are included.  When either bound is
-    None the corresponding check is skipped (no filtering on that side).
+    For each candidate A-B pair whose angular separation falls in
+    [scale_lower_deg, scale_upper_deg], a flat-sky KD-tree finds the C/D
+    candidates inside the A-B inscribed circle in O(log n) instead of
+    scanning all remaining stars.  Quads are assigned to this cell by their
+    sky centroid, matching the original deduplication criterion.
 
     Returns
     -------
     codes           : (M, 4) float32 — hash codes for valid quads
-    quad_source_ids : (M, 4) int64   — Gaia source IDs in canonical ABCD order
+    quad_source_ids : (M, 4) int64   — source IDs in canonical ABCD order
     """
     star_ra    = np.asarray(star_ra,    dtype=float)
     star_dec   = np.asarray(star_dec,   dtype=float)
     star_mv    = np.asarray(star_mv,    dtype=float)
     source_ids = np.asarray(source_ids, dtype=np.int64)
 
+    if len(star_ra) < 4:
+        return np.empty((0, 4), dtype=np.float32), np.empty((0, 4), dtype=np.int64)
+
+    # Brightest-first ordering (smallest mV = brightest)
     order      = np.argsort(star_mv)
     star_ra    = star_ra[order]
     star_dec   = star_dec[order]
     source_ids = source_ids[order]
 
+    scale_lo = scale_lower_deg if scale_lower_deg is not None else 0.0
+    scale_hi = scale_upper_deg  # may be None (no upper bound)
+
+    # Flat-sky projected KD-tree: x = ra · cos(dec_center), y = dec
+    # Valid for cells up to ~10° (the grid cells are typically 0.5°–2°).
+    dec_center = (grid_dec[0] + grid_dec[1]) / 2
+    cos_dec    = np.cos(np.radians(dec_center))
+    pts = np.column_stack([star_ra * cos_dec, star_dec])
+    spatial_tree = cKDTree(pts)
+
+    # Upper bound for the KD-tree radius query.
+    # When scale_hi is finite use it directly; otherwise cap at 3× cell diagonal
+    # (the search region fed into this function spans ±1 cell in each direction).
+    if scale_hi is not None:
+        r_hi = scale_hi
+    else:
+        r_hi = 3.0 * np.hypot(
+            grid_ra[1]  - grid_ra[0],
+            grid_dec[1] - grid_dec[0],
+        )
+
     times_used = np.zeros(len(star_ra), dtype=int)
     codes_out: List[Tuple] = []
     sids_out:  List[List]  = []
 
-    for quad in itertools.combinations(range(len(star_ra)), 4):
-        if any(times_used[i] >= max_times_used for i in quad):
+    n = len(star_ra)
+    for i in range(n):
+        if times_used[i] >= max_times_used:
             continue
 
-        q_ra  = star_ra[list(quad)]
-        q_dec = star_dec[list(quad)]
+        # B candidates: all stars within r_hi of A in projected space.
+        # Requiring j > i ensures each unordered {A, B} pair is visited once.
+        b_candidates = spatial_tree.query_ball_point(pts[i], r=r_hi)
 
-        if not (grid_ra[0]  <= np.mean(q_ra)  <= grid_ra[1] and
-                grid_dec[0] <= np.mean(q_dec) <= grid_dec[1]):
-            continue
-
-        # Scale filter: check AB separation before the more expensive hash
-        if scale_lower_deg is not None or scale_upper_deg is not None:
-            sep = _ab_sep_deg(q_ra, q_dec)
-            if scale_lower_deg is not None and sep < scale_lower_deg:
+        for j in b_candidates:
+            if j <= i:
                 continue
-            if scale_upper_deg is not None and sep > scale_upper_deg:
+            if times_used[j] >= max_times_used:
                 continue
 
-        code = compute_hash_code(q_ra, q_dec)
-        if code is None:
-            continue
+            sep = _sep2_deg(star_ra[i], star_dec[i], star_ra[j], star_dec[j])
+            if sep < scale_lo:
+                continue
+            if scale_hi is not None and sep > scale_hi:
+                continue
 
-        abcd = _sky_abcd(q_ra, q_dec)
-        if abcd is None:
-            continue
+            # C/D candidates must lie within the A-B inscribed circle
+            # (centre = midpoint of A-B, radius = sep/2).
+            # Stars inside the inscribed circle cannot form a longer pair than
+            # A-B, so A-B remains the most-separated pair for any quad formed.
+            mid_proj = (pts[i] + pts[j]) * 0.5
+            r_ins    = sep / 2  # degrees (same scale as projected coords)
 
-        ordered_sids = [source_ids[quad[abcd[k]]] for k in range(4)]
-        codes_out.append(code)
-        sids_out.append(ordered_sids)
-        for i in quad:
-            times_used[i] += 1
+            cd_raw = spatial_tree.query_ball_point(mid_proj, r=r_ins)
+            cd_candidates = [k for k in cd_raw if k != i and k != j]
+            if len(cd_candidates) < 2:
+                continue
+
+            for ci in range(len(cd_candidates)):
+                c = cd_candidates[ci]
+                if times_used[c] >= max_times_used:
+                    continue
+                for d in cd_candidates[ci + 1:]:
+                    if times_used[d] >= max_times_used:
+                        continue
+
+                    # Assign quad to cell by centroid (same criterion as before)
+                    mean_ra  = (star_ra[i]  + star_ra[j]  + star_ra[c]  + star_ra[d])  / 4
+                    mean_dec = (star_dec[i] + star_dec[j] + star_dec[c] + star_dec[d]) / 4
+                    if not (grid_ra[0]  <= mean_ra  <= grid_ra[1] and
+                            grid_dec[0] <= mean_dec <= grid_dec[1]):
+                        continue
+
+                    local = [i, j, c, d]
+                    q_ra  = star_ra[local]
+                    q_dec = star_dec[local]
+
+                    code = compute_hash_code(q_ra, q_dec)
+                    if code is None:
+                        continue
+
+                    abcd = _sky_abcd(q_ra, q_dec)
+                    if abcd is None:
+                        continue
+
+                    ordered_sids = [source_ids[local[abcd[k]]] for k in range(4)]
+                    codes_out.append(code)
+                    sids_out.append(ordered_sids)
+                    for k in local:
+                        times_used[k] += 1
 
     if codes_out:
         return (

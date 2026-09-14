@@ -1,0 +1,24 @@
+# PersistentVolumeClaim for the astrometric index files (CodeSpaceTree + StarPositionTree).
+#
+# Minikube: the PVC is fulfilled by the default StorageClass (hostpath).
+#   To populate the volume, copy your index files in with:
+#     kubectl -n observation-tools cp indices/ <plate-solver-pod>:/indices/
+#
+# Production: replace with a ReadWriteMany StorageClass (e.g. NFS, EFS, Ceph)
+#   so multiple plate-solver replicas can share the read-only index.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: index-pvc
+  namespace: observation-tools
+  labels:
+    app.kubernetes.io/part-of: observation-tools
+    app.kubernetes.io/component: plate-solver
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # Leave storageClassName unset to use the cluster default.
+  # For minikube this resolves to the hostpath provisioner automatically.

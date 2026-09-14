@@ -38,7 +38,9 @@ Solve response body (JSON)
   "quads_tried":      7,
   "quads_matched":    2,
   "wcs": {                                       // null when not solved
-    "A": [[ax, ay, a1], [bx, by, b1]]           // x_pix = A[0]·[ra, dec, 1]
+    "A":    [[ax, ay, a1], [bx, by, b1]],       // pix = A @ [ξ, η, 1]  (gnomonic)
+    "ra0":  83.82,                               // tangent-point RA  (degrees)
+    "dec0": -5.39                                // tangent-point Dec (degrees)
   },
   "match_ra":         [83.75, 84.25, 83.80, 84.20],  // null when not solved
   "match_dec":        [-5.5, -5.0, -5.0, -5.5],
@@ -294,7 +296,11 @@ def solve():
     }
 
     if result.solved:
-        resp["wcs"] = {"A": result.wcs.A.tolist()}
+        resp["wcs"] = {
+            "A":    result.wcs.A.tolist(),
+            "ra0":  float(getattr(result.wcs, "ra0",  0.0)),
+            "dec0": float(getattr(result.wcs, "dec0", 0.0)),
+        }
         if result.match_ra is not None:
             resp["match_ra"]  = result.match_ra.tolist()
             resp["match_dec"] = result.match_dec.tolist()

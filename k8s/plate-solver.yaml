@@ -1,0 +1,88 @@
+# Plate solver — loads astrometric index files from the index-pvc volume.
+# The PVC must be populated before this Deployment will become Ready.
+# See index-pvc.yaml and the Makefile for population instructions.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plate-solver
+  namespace: observation-tools
+  labels:
+    app: plate-solver
+    app.kubernetes.io/part-of: observation-tools
+    app.kubernetes.io/component: astrometry
+spec:
+  # Single replica: the index files are large and kept in memory.
+  # Scale up only if your cluster has sufficient RAM per replica.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: plate-solver
+  template:
+    metadata:
+      labels:
+        app: plate-solver
+    spec:
+      containers:
+        - name: plate-solver
+          image: observation-tools/plate-solver:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5000
+          env:
+            - name: PORT
+              value: "5000"
+            - name: WORKERS
+              value: "2"
+            - name: TIMEOUT
+              value: "120"
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+          volumeMounts:
+            - name: index-vol
+              mountPath: /indices
+              readOnly: true
+          resources:
+            # Index files + KD-trees live in RAM — size depends on catalogue region.
+            # 4 Gi covers a ~10°×10° region at scale tiers 8-11 with Gaia.
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "6Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30   # allow time for index load
+            periodSeconds: 15
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: index-vol
+          persistentVolumeClaim:
+            claimName: index-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: plate-solver
+  namespace: observation-tools
+  labels:
+    app: plate-solver
+    app.kubernetes.io/part-of: observation-tools
+spec:
+  selector:
+    app: plate-solver
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+  type: ClusterIP

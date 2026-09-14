@@ -1,0 +1,28 @@
+# Shared configuration for all pipeline services.
+# Override individual values with per-Deployment environment vars.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+  namespace: observation-tools
+  labels:
+    app.kubernetes.io/part-of: observation-tools
+data:
+  # Source extraction defaults
+  THRESHOLD:      "3.0"
+  ELONG_THRESH:   "3.0"
+  MIN_STREAK_PX:  "20.0"
+  SAT_FWHM_MAX:   "20.0"
+  BKG_BOX_SIZE:   "64"
+  GAIN:           "1.0"
+
+  # Plate solver
+  INDEX_DIR:   /indices
+  STAR_INDEX:  /indices/stars.joblib
+
+  # Pipeline coordinator timeouts (seconds)
+  EXTRACT_TIMEOUT_S: "120"
+  SOLVE_TIMEOUT_S:   "60"
+  PROJECT_TIMEOUT_S: "30"
+  ASSOC_TIMEOUT_S:   "120"
+  MAX_FRAME_WORKERS: "8"

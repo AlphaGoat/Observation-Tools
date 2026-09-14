@@ -1,0 +1,78 @@
+# Satellite extractor — same image as star-extractor, "satellites" mode.
+# Returns satellite point-source detections only.
+# Deployed independently so a different extractor algorithm (e.g. a deep-
+# learning model) can be swapped in by updating this Deployment alone.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: satellite-extractor
+  namespace: observation-tools
+  labels:
+    app: satellite-extractor
+    app.kubernetes.io/part-of: observation-tools
+    app.kubernetes.io/component: source-extraction
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: satellite-extractor
+  template:
+    metadata:
+      labels:
+        app: satellite-extractor
+    spec:
+      containers:
+        - name: satellite-extractor
+          image: observation-tools/source-extractor:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5002
+          env:
+            - name: EXTRACTOR_TYPE
+              value: "satellites"
+            - name: PORT
+              value: "5002"
+            - name: WORKERS
+              value: "2"
+            - name: TIMEOUT
+              value: "120"
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "768Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5002
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5002
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: satellite-extractor
+  namespace: observation-tools
+  labels:
+    app: satellite-extractor
+    app.kubernetes.io/part-of: observation-tools
+spec:
+  selector:
+    app: satellite-extractor
+  ports:
+    - name: http
+      port: 5002
+      targetPort: 5002
+  type: ClusterIP
