@@ -167,6 +167,82 @@ services:
           memory: 1G
 
   # --------------------------------------------------------------------------
+  # Catalog store (RSO catalog + uncorrelated-track storage)
+  #
+  # Unlike every other service above, this one owns persistent, mutable
+  # state (the SQLite database on the catalog-data volume) rather than being
+  # a stateless request/response API. Not in pipeline-coordinator's own
+  # depends_on -- it's a transitive dependency via correlator below, and
+  # correlation itself is opt-in per pipeline-run request (see
+  # pipeline/coordinator.py's module docstring), not a hard startup
+  # requirement for the coordinator.
+  # --------------------------------------------------------------------------
+  catalog-store:
+    build:
+      context: .
+      dockerfile: src/catalog_store/Dockerfile
+    container_name: catalog-store
+    environment:
+      PORT: "5004"
+      WORKERS: "4"
+      DB_PATH: /data/catalog.db
+    ports:
+      - "5004:5004"
+    volumes:
+      - catalog-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - obs-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  # --------------------------------------------------------------------------
+  # Correlator (track-to-track generation/scoring/pruning/promotion)
+  #
+  # Stateless -- holds no data of its own, every decision reads and writes
+  # against catalog-store over HTTP. Called from pipeline-coordinator's
+  # POST /pipeline/run when the request opts in with "correlate": true
+  # (see correlator/correlate.py's module docstring for the algorithm).
+  # --------------------------------------------------------------------------
+  correlator:
+    build:
+      context: .
+      dockerfile: src/correlator/Dockerfile
+    container_name: correlator
+    environment:
+      PORT: "5005"
+      WORKERS: "4"
+      CATALOG_STORE_URL: "http://catalog-store:5004"
+    ports:
+      - "5005:5005"
+    depends_on:
+      catalog-store:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5005/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - obs-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  # --------------------------------------------------------------------------
   # Pipeline coordinator (external entry point)
   # --------------------------------------------------------------------------
   pipeline-coordinator:
@@ -183,6 +259,7 @@ services:
       PLATE_SOLVER_URL: "http://plate-solver:5000"
       PROJECTOR_URL: "http://projector:5003"
       ASSOCIATOR_URL: "http://associator:5001"
+      CORRELATOR_URL: "http://correlator:5005"
       MAX_FRAME_WORKERS: "8"
     ports:
       - "8080:8080"
@@ -216,3 +293,7 @@ services:
 networks:
   obs-net:
     driver: bridge
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  catalog-data:

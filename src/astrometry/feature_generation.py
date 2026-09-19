@@ -69,8 +69,15 @@ def compute_hash_code(
 
     # Project RA to flat sky using the declination of the A-B midpoint.
     # This makes angular distances isotropic for the affine transform.
+    # Negated to match _gnomonic's tangent-plane chirality (kd_tree.py):
+    # xi = -cos(dec)*sin(ra-ra0)/cos_c increases with *decreasing* RA. Without
+    # this flip, a pixel-space quad code can never simultaneously match a
+    # stored catalog code and yield an accurate _fit_wcs solution -- confirmed
+    # empirically: same quad, opposite pixel parities, one gives an exact code
+    # match with a garbage (~49,000 px^2 residual) WCS fit, the other an exact
+    # WCS fit (0 residual) with no code match at all.
     cos_ab    = np.cos(np.radians(center_dec))
-    proj_ra   = quad_ra * cos_ab
+    proj_ra   = -quad_ra * cos_ab
     delta_ra  = proj_ra[star_b_idx]  - proj_ra[star_a_idx]
     delta_dec = quad_dec[star_b_idx] - quad_dec[star_a_idx]
 

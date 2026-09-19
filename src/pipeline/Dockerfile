@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir --prefix=/install \
 FROM python:3.11-slim AS runtime
 
 LABEL org.opencontainers.image.title="Observation-Tools Pipeline Coordinator"
-LABEL org.opencontainers.image.description="Orchestrates the full observation pipeline: extract → solve → project → associate"
+LABEL org.opencontainers.image.description="Orchestrates the full observation pipeline: extract → solve → project → associate → correlate (opt-in)"
 
 COPY --from=builder /install /usr/local
 
@@ -31,6 +31,7 @@ ENV PYTHONPATH=/app/src \
     PLATE_SOLVER_URL=http://plate-solver:5000 \
     PROJECTOR_URL=http://projector:5003 \
     ASSOCIATOR_URL=http://associator:5001 \
+    CORRELATOR_URL=http://correlator:5005 \
     MAX_FRAME_WORKERS=8
 
 EXPOSE 8080

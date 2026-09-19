@@ -28,6 +28,8 @@ IMG_EXTRACTOR   := observation-tools/source-extractor:$(IMAGE_TAG)
 IMG_SOLVER      := observation-tools/plate-solver:$(IMAGE_TAG)
 IMG_PROJECTOR   := observation-tools/projector:$(IMAGE_TAG)
 IMG_ASSOCIATOR  := observation-tools/associator:$(IMAGE_TAG)
+IMG_CATALOG_STORE := observation-tools/catalog-store:$(IMAGE_TAG)
+IMG_CORRELATOR  := observation-tools/correlator:$(IMAGE_TAG)
 IMG_COORDINATOR := observation-tools/pipeline-coordinator:$(IMAGE_TAG)
 
 # Dockerfiles
@@ -35,12 +37,16 @@ DF_EXTRACTOR   := src/source_extraction/Dockerfile
 DF_SOLVER      := src/astrometry/Dockerfile
 DF_PROJECTOR   := src/obs/Dockerfile
 DF_ASSOCIATOR  := src/associator/Dockerfile
+DF_CATALOG_STORE := src/catalog_store/Dockerfile
+DF_CORRELATOR  := src/correlator/Dockerfile
 DF_COORDINATOR := src/pipeline/Dockerfile
 
 .PHONY: all minikube-start minikube-stop build \
-        build-extractor build-solver build-projector build-associator build-coordinator \
+        build-extractor build-solver build-projector build-associator \
+        build-catalog-store build-correlator build-coordinator \
         deploy undeploy wait status url port-forward \
         logs-coordinator logs-solver logs-star logs-satellite logs-projector logs-associator \
+        logs-catalog-store logs-correlator \
         populate-index shell-solver test-health
 
 # ── Minikube ──────────────────────────────────────────────────────────────────
@@ -57,35 +63,48 @@ minikube-stop:
 	minikube stop
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-# All images are built inside minikube's Docker daemon so Kubernetes can pull
-# them without a registry.  `eval $(minikube docker-env)` is injected per-rule.
+# Images are built with `minikube image build`, which builds directly against
+# whatever container runtime the cluster's node actually uses (containerd here)
+# and loads the result into its image store -- no registry needed, and no
+# separate "point my shell at minikube's daemon" step.
+#
+# Deliberately not `eval $(minikube docker-env) && docker build ...`: on a
+# containerd-runtime node that command tunnels over SSH (minikube itself
+# labels it "highly experimental" in this configuration) and was observed
+# hitting spurious SSH host-key-changed failures on every invocation in
+# practice. `minikube image build` talks to the node directly and doesn't
+# have this problem.
 
-build: build-extractor build-solver build-projector build-associator build-coordinator
+build: build-extractor build-solver build-projector build-associator \
+       build-catalog-store build-correlator build-coordinator
 
 build-extractor:
 	@echo "▶ Building source-extractor…"
-	eval $$(minikube docker-env) && \
-	    docker build -f $(DF_EXTRACTOR) -t $(IMG_EXTRACTOR) .
+	minikube image build . -f $(DF_EXTRACTOR) -t $(IMG_EXTRACTOR)
 
 build-solver:
 	@echo "▶ Building plate-solver…"
-	eval $$(minikube docker-env) && \
-	    docker build -f $(DF_SOLVER) -t $(IMG_SOLVER) .
+	minikube image build . -f $(DF_SOLVER) -t $(IMG_SOLVER)
 
 build-projector:
 	@echo "▶ Building projector…"
-	eval $$(minikube docker-env) && \
-	    docker build -f $(DF_PROJECTOR) -t $(IMG_PROJECTOR) .
+	minikube image build . -f $(DF_PROJECTOR) -t $(IMG_PROJECTOR)
 
 build-associator:
 	@echo "▶ Building associator…"
-	eval $$(minikube docker-env) && \
-	    docker build -f $(DF_ASSOCIATOR) -t $(IMG_ASSOCIATOR) .
+	minikube image build . -f $(DF_ASSOCIATOR) -t $(IMG_ASSOCIATOR)
+
+build-catalog-store:
+	@echo "▶ Building catalog-store…"
+	minikube image build . -f $(DF_CATALOG_STORE) -t $(IMG_CATALOG_STORE)
+
+build-correlator:
+	@echo "▶ Building correlator…"
+	minikube image build . -f $(DF_CORRELATOR) -t $(IMG_CORRELATOR)
 
 build-coordinator:
 	@echo "▶ Building pipeline-coordinator…"
-	eval $$(minikube docker-env) && \
-	    docker build -f $(DF_COORDINATOR) -t $(IMG_COORDINATOR) .
+	minikube image build . -f $(DF_COORDINATOR) -t $(IMG_COORDINATOR)
 
 # ── Deploy ────────────────────────────────────────────────────────────────────
 
@@ -100,7 +119,8 @@ undeploy:
 wait:
 	@echo "Waiting for all Deployments in $(NAMESPACE) to become Available…"
 	kubectl wait deployment \
-	    star-extractor satellite-extractor plate-solver projector associator pipeline-coordinator \
+	    star-extractor satellite-extractor plate-solver projector associator \
+	    catalog-store correlator pipeline-coordinator \
 	    -n $(NAMESPACE) \
 	    --for=condition=Available \
 	    --timeout=300s
@@ -114,9 +134,10 @@ SOURCE_INDEX_DIR ?= indices/
 populate-index:
 	@echo "Copying $(SOURCE_INDEX_DIR) into plate-solver pod at /indices/ …"
 	$(eval POD := $(shell kubectl get pods -n $(NAMESPACE) -l app=plate-solver \
+	    --field-selector=status.phase=Running \
 	    -o jsonpath='{.items[0].metadata.name}'))
 	@test -n "$(POD)" || (echo "ERROR: no plate-solver pod found" && exit 1)
-	kubectl -n $(NAMESPACE) cp $(SOURCE_INDEX_DIR) $(POD):/indices/
+	kubectl -n $(NAMESPACE) cp $(SOURCE_INDEX_DIR)/. $(POD):/indices/
 	@echo "Done.  Restart the plate-solver to reload:"
 	@echo "  kubectl rollout restart deployment/plate-solver -n $(NAMESPACE)"
 
@@ -153,6 +174,12 @@ logs-projector:
 
 logs-associator:
 	kubectl logs -n $(NAMESPACE) -l app=associator -f --tail=100
+
+logs-catalog-store:
+	kubectl logs -n $(NAMESPACE) -l app=catalog-store -f --tail=100
+
+logs-correlator:
+	kubectl logs -n $(NAMESPACE) -l app=correlator -f --tail=100
 
 # ── Debug ─────────────────────────────────────────────────────────────────────
 

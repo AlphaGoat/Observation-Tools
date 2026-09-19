@@ -43,6 +43,8 @@ spec:
               value: "http://projector:5003"
             - name: ASSOCIATOR_URL
               value: "http://associator:5001"
+            - name: CORRELATOR_URL
+              value: "http://correlator:5005"
           envFrom:
             - configMapRef:
                 name: pipeline-config

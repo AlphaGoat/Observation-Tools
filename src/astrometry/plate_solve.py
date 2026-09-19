@@ -454,36 +454,21 @@ def _compute_residuals(
     For each detected star, find the nearest catalogue star (via WCS inverse),
     and return angular residuals in arcseconds.
 
-    The WCS is used forward-only here: we project each detected pixel position
-    to an approximate (RA, Dec) via a 2D grid search around the WCS-predicted
-    sky position, then look up the true catalogue star.
+    Uses WCS.pix_to_radec (proper gnomonic un-projection) to get each
+    detection's sky position, then looks up the nearest true catalogue star.
     """
-    # Approximate pixel scale: arcsec/pixel from the WCS matrix
+    # Approximate pixel scale: degrees per pixel, from the WCS matrix
     A = wcs.A
-    # Plate scale: degrees per pixel in x and y directions
     scale_x = np.sqrt(A[0, 0] ** 2 + A[1, 0] ** 2)  # deg/pix
     scale_y = np.sqrt(A[0, 1] ** 2 + A[1, 1] ** 2)
     scale_deg_per_pix = (scale_x + scale_y) / 2
+    radius_deg = search_radius_pix * scale_deg_per_pix * 3
 
-    # Invert the affine WCS: (ra, dec) → (x, y) is A @ [ra, dec, 1]
-    # We need the pseudo-inverse for (x, y) → (ra, dec).
-    # A is (2, 3): stack homogeneous to get a 3×3 system.
-    # Simple least-squares inverse:
-    A2 = wcs.A[:, :2]   # (2, 2)
-    b  = wcs.A[:, 2]    # (2,)
-    try:
-        A2_inv = np.linalg.inv(A2)
-    except np.linalg.LinAlgError:
-        return np.array([])
+    ra_pred, dec_pred = wcs.pix_to_radec(np.asarray(x_pix), np.asarray(y_pix))
 
     residuals = []
-    for xi, yi in zip(x_pix, y_pix):
-        pix_vec = np.array([xi, yi]) - b
-        radec   = A2_inv @ pix_vec   # approximate (ra, dec) for this pixel
-
-        # Nearest catalogue match within a loose sky radius
-        radius_deg = search_radius_pix * scale_deg_per_pix * 3
-        sid, ang_deg = star_tree.nearest(float(radec[0]), float(radec[1]))
+    for ra_i, dec_i in zip(ra_pred, dec_pred):
+        sid, ang_deg = star_tree.nearest(float(ra_i), float(dec_i))
         if ang_deg < radius_deg:
             residuals.append(ang_deg * 3600.0)   # convert to arcsec
 

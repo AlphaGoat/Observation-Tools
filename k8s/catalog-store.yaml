@@ -1,0 +1,101 @@
+# Catalog store — the one stateful service in the pipeline (SQLite, WAL
+# mode, on the catalog-data PVC). Single replica only: multiple gunicorn
+# WORKERS within this one pod are safe (SQLite WAL + busy_timeout handles
+# that, see src/catalog_store/db.py), but multiple *pods* writing the same
+# SQLite file is not something this service has been built or tested for,
+# and a ReadWriteOnce PVC can only be mounted read-write by one node at a
+# time anyway. Do not scale this Deployment's replicas.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: catalog-data-pvc
+  namespace: observation-tools
+  labels:
+    app.kubernetes.io/part-of: observation-tools
+    app.kubernetes.io/component: catalog-store
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # Leave storageClassName unset to use the cluster default (hostpath on minikube).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-store
+  namespace: observation-tools
+  labels:
+    app: catalog-store
+    app.kubernetes.io/part-of: observation-tools
+    app.kubernetes.io/component: catalog-store
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # avoid two pods briefly both mounting the ReadWriteOnce PVC during a rolling update
+  selector:
+    matchLabels:
+      app: catalog-store
+  template:
+    metadata:
+      labels:
+        app: catalog-store
+    spec:
+      containers:
+        - name: catalog-store
+          image: observation-tools/catalog-store:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5004
+          env:
+            - name: PORT
+              value: "5004"
+            - name: WORKERS
+              value: "4"
+            - name: DB_PATH
+              value: "/data/catalog.db"
+          volumeMounts:
+            - name: catalog-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5004
+            initialDelaySeconds: 8
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5004
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: catalog-data
+          persistentVolumeClaim:
+            claimName: catalog-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-store
+  namespace: observation-tools
+  labels:
+    app: catalog-store
+    app.kubernetes.io/part-of: observation-tools
+spec:
+  selector:
+    app: catalog-store
+  ports:
+    - name: http
+      port: 5004
+      targetPort: 5004
+  type: ClusterIP

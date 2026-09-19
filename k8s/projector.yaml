@@ -33,12 +33,17 @@ spec:
             - name: TIMEOUT
               value: "30"
           resources:
+            # Request/limit sized for 4 gunicorn workers each importing
+            # astrometry.kd_tree's dependency chain (astropy, astropy-healpix,
+            # scipy, matplotlib) -- those imports alone run well past the old
+            # 256Mi limit and were getting the workers OOMKilled. CPU stays
+            # light per this service's own code (pure numpy linear algebra).
             requests:
-              cpu: "100m"
-              memory: "128Mi"
+              cpu: "200m"
+              memory: "512Mi"
             limits:
-              cpu: "500m"
-              memory: "256Mi"
+              cpu: "1"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health

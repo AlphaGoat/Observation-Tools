@@ -18,6 +18,11 @@ Drives one complete observation pipeline run:
                           ┌────────────────────────────────▼────────────────┐
                           │               associator                         │
                           │  (receives all frame observations together)      │
+                          └────────────────────────────────┬────────────────┘
+                                                             │  (opt-in, "correlate": true)
+                          ┌────────────────────────────────▼────────────────┐
+                          │               correlator                         │
+                          │  (one call per track, sequential -- see below)   │
                           └─────────────────────────────────────────────────┘
 
 For each frame:
@@ -29,6 +34,15 @@ For each frame:
 
 After all frames:
   5. Associator ── fits tracks across all frames using MHT
+  6. Correlator (opt-in) ── ingests each track into catalog-store and
+     correlates it against the catalog (generation/scoring/promotion, see
+     correlator/correlate.py). Tracks are sent one at a time, in order, not
+     concurrently: two tracks from the same run can legitimately need to
+     attribute to the same in-progress hypothesis, and catalog-store's
+     generation-phase writes (as opposed to promote_object) aren't
+     cross-request atomic -- sending them concurrently risked two tracks
+     racing to spawn separate, duplicate hypotheses instead of one seeing
+     the other's already-created one.
 
 Endpoints
 ---------
@@ -59,7 +73,19 @@ Run request body (JSON)
   "fov_deg":       2.0,         // expected image FOV (degrees) for tier selection
   "threshold":     3.0,         // SEP detection threshold (sigma)
   "elong_thresh":  3.0,         // a/b elongation threshold for streak classification
-  "min_streak_px": 20.0         // minimum star trail length (pixels)
+  "min_streak_px": 20.0,        // minimum star trail length (pixels)
+
+  // ── Correlation (optional, opt-in) ───────────────────────────────────────
+  // Ingests each associator track into catalog-store and correlates it.
+  // Off by default: unlike every earlier stage, this writes to shared,
+  // persistent state (the catalog), so it isn't turned on implicitly.
+  "correlate":        false,          // optional, default false
+  "sensor_id":        "rubin",        // required if correlate=true
+  "site_position_km": [x, y, z]       // optional even if correlate=true; applied
+                                       // to every track in this run as a fixed
+                                       // observer position (see module docstring
+                                       // "Correlation" section for the caveat this
+                                       // implies), needed for IOD-gated promotion
 }
 
 Run response body (JSON)
@@ -82,8 +108,39 @@ Run response body (JSON)
       "n_observations": 2,
       "error":          null     // error description if frame failed, else null
     }
+  ],
+  "correlation_results": [        // present (possibly empty) iff "correlate" was requested
+    {
+      "track_idx":  0,            // index into the "tracks" array above
+      "result":     {...} | null, // the correlator's own /correlate response, see
+                                   // correlator/api.py -- action, branches, promoted, iod
+      "error":      null          // set instead of "result" if this track's
+                                   // correlate call itself failed (never aborts the run)
+    }
   ]
 }
+
+Correlation
+-------------
+Off by default ("correlate": false) because, unlike every other stage
+here, it writes to shared persistent state (the catalog via catalog-
+store) rather than just computing a response -- re-running the same
+frames with correlation on will ingest and attempt to correlate the same
+tracks again, is not idempotent, and is meant to be turned on
+deliberately, not as a side effect of testing/re-running a pipeline call.
+
+Each associator track becomes one catalog-store attributable: ra/dec/
+ra_dot/dec_dot/covariance from the track's final_state/final_covar, and
+t_start/t_end spanning its first to last observation. site_position_km,
+if given, is applied identically to every track in the run -- a
+simplification, not a real per-epoch observer position: nothing in this
+pipeline currently computes true site geodesy (lat/lon/alt -> inertial
+position over time), so a single fixed vector is the best available
+approximation for now (see src/correlator/correlate.py and
+src/iod/double_r_lambert.py for how it's used, and src/iod/kepler.py's
+"Future work" notes for the larger gap this simplification stands in
+for). Omitting it entirely is always safe -- correlation still runs, just
+without the option of an IOD-based promotion (see correlator/correlate.py).
 
 Environment variables
 ---------------------
@@ -92,11 +149,13 @@ SATELLITE_EXTRACTOR_URL http://satellite-extractor:5002
 PLATE_SOLVER_URL        http://plate-solver:5000
 PROJECTOR_URL           http://projector:5003
 ASSOCIATOR_URL          http://associator:5001
+CORRELATOR_URL          http://correlator:5005
 MAX_FRAME_WORKERS       Max concurrent frame threads (default 8)
 EXTRACT_TIMEOUT_S       Per-service HTTP timeout for extraction (default 120)
 SOLVE_TIMEOUT_S         Plate solver HTTP timeout (default 60)
 PROJECT_TIMEOUT_S       Projector HTTP timeout (default 30)
 ASSOC_TIMEOUT_S         Associator HTTP timeout (default 120)
+CORRELATE_TIMEOUT_S     Per-track correlator HTTP timeout (default 30)
 HOST                    Bind host (default 0.0.0.0)
 PORT                    Bind port (default 8080)
 
@@ -138,6 +197,8 @@ _PROJECTOR_URL         = os.environ.get("PROJECTOR_URL",
                                         "http://projector:5003")
 _ASSOCIATOR_URL        = os.environ.get("ASSOCIATOR_URL",
                                         "http://associator:5001")
+_CORRELATOR_URL        = os.environ.get("CORRELATOR_URL",
+                                        "http://correlator:5005")
 
 _MAX_FRAME_WORKERS = int(os.environ.get("MAX_FRAME_WORKERS", "8"))
 
@@ -145,6 +206,7 @@ _EXTRACT_TIMEOUT   = int(os.environ.get("EXTRACT_TIMEOUT_S",  "120"))
 _SOLVE_TIMEOUT     = int(os.environ.get("SOLVE_TIMEOUT_S",    "60"))
 _PROJECT_TIMEOUT   = int(os.environ.get("PROJECT_TIMEOUT_S",  "30"))
 _ASSOC_TIMEOUT     = int(os.environ.get("ASSOC_TIMEOUT_S",    "120"))
+_CORRELATE_TIMEOUT = int(os.environ.get("CORRELATE_TIMEOUT_S", "30"))
 
 
 # ── Service call helpers ──────────────────────────────────────────────────────
@@ -307,6 +369,54 @@ def _process_frame(
     return result
 
 
+# ── Correlation (opt-in, Stage 6) ───────────────────────────────────────────────
+
+def _build_track_attributable(track: dict, sensor_id: str, site_position_km: Optional[list]) -> dict:
+    """Convert one associator track into a catalog-store attributable body."""
+    observations = track["observations"]
+    body = {
+        "sensor_id": sensor_id,
+        "t_start":   min(o["t_start"] for o in observations),
+        "t_end":     max(o["t_end"] for o in observations),
+        "ra":        track["final_state"]["ra"],
+        "dec":       track["final_state"]["dec"],
+        "ra_dot":    track["final_state"]["ra_dot"],
+        "dec_dot":   track["final_state"]["dec_dot"],
+        "covariance": track["final_covar"],
+    }
+    if site_position_km is not None:
+        body["site_position_km"] = site_position_km
+    return body
+
+
+def _correlate_tracks(tracks: List[dict], sensor_id: str, site_position_km: Optional[list]) -> List[dict]:
+    """
+    Ingest and correlate each track against the catalog, one at a time.
+
+    Sequential, not concurrent (see module docstring's Stage 6 note): two
+    tracks from the same run can legitimately need to attribute to the
+    same in-progress hypothesis, and catalog-store's generation-phase
+    writes aren't cross-request atomic the way promote_object is.
+    """
+    results: List[dict] = []
+    for idx, track in enumerate(tracks):
+        try:
+            attributable = _build_track_attributable(track, sensor_id, site_position_km)
+        except (KeyError, IndexError) as exc:
+            results.append({"track_idx": idx, "result": None, "error": f"malformed track: {exc}"})
+            continue
+
+        ok, data = _post(f"{_CORRELATOR_URL}/correlate", attributable, _CORRELATE_TIMEOUT)
+        if ok:
+            results.append({"track_idx": idx, "result": data, "error": None})
+        else:
+            error = data.get("error", "unknown correlation error")
+            results.append({"track_idx": idx, "result": None, "error": error})
+            log.warning("Correlation failed for track %d: %s", idx, error)
+
+    return results
+
+
 # ── Flask app ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -321,6 +431,7 @@ def health():
         "plate_solver":      f"{_PLATE_SOLVER_URL}/health",
         "projector":         f"{_PROJECTOR_URL}/health",
         "associator":        f"{_ASSOCIATOR_URL}/health",
+        "correlator":        f"{_CORRELATOR_URL}/health",
     }
     statuses: Dict[str, Any] = {}
     all_ok = True
@@ -365,11 +476,17 @@ def pipeline_run():
                     "error": f"frames[{k}] is missing required field '{req}'"
                 }), 400
 
+    correlate = bool(body.get("correlate", False))
+    if correlate and "sensor_id" not in body:
+        return jsonify({"error": "'sensor_id' is required when 'correlate' is true"}), 400
+
     # ── Parse optional parameters ─────────────────────────────────────────────
     fov_deg      = body.get("fov_deg")
     exposure_time = float(body["exposure_time"])
     gap_time      = float(body["gap_time"])
     sensor_fov    = float(body["sensor_fov"])
+    sensor_id     = body.get("sensor_id")
+    site_position_km = body.get("site_position_km")
 
     extract_params = {k: body[k] for k in (
         "threshold", "elong_thresh", "min_streak_px",
@@ -450,6 +567,15 @@ def pipeline_run():
     else:
         log.warning("No observations across any frame — skipping association")
 
+    # ── Stage 6: correlate tracks against the catalog (opt-in) ────────────────
+    correlation_results: List[dict] = []
+    if correlate and tracks:
+        correlation_results = _correlate_tracks(tracks, sensor_id, site_position_km)
+        n_promoted = sum(1 for r in correlation_results if r["result"] and r["result"].get("promoted"))
+        log.info("Correlation done: %d track(s) processed, %d promoted", len(correlation_results), n_promoted)
+    elif correlate:
+        log.info("Correlation requested but no tracks to correlate")
+
     elapsed = time.perf_counter() - t0
 
     # ── Build response ────────────────────────────────────────────────────────
@@ -474,6 +600,7 @@ def pipeline_run():
             }
             for r in frame_results
         ],
+        "correlation_results": correlation_results,
     }
     if assoc_error:
         resp["association_error"] = assoc_error

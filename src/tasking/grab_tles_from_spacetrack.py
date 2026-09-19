@@ -3,6 +3,18 @@ Utilities for grabbing TLEs from Space-Track.org
 
 Author: Peter Thomas
 Date: 2025-10-12
+
+---
+Fix (2026-09-17): "active" and "visual" used to add a "CURRENT/Y" predicate.
+Verified against Space-Track's live /basicspacedata/modeldef/class/gp --
+there is no "CURRENT" field on the `gp` class, so that predicate 500'd on
+every real request (caught by actually running this against Space-Track
+while testing scheduler-service's tle-refresh CronJob, not by inspection).
+`gp` already returns only the latest elset per object -- that's what
+distinguishes it from `gp_history` -- so the predicate was never doing
+anything but breaking the query. Removed it; "active" and "all" are now
+identical queries (both plain `class/gp`) until a real distinction (e.g.
+filtering DECAY_DATE) is designed.
 """
 import os
 import json
@@ -17,8 +29,8 @@ from typing import Optional
 # "visual"  - same, but filtered to payloads only (most likely optically observable)
 # "all"     - most recent TLE for all objects including debris and rocket bodies
 _CATALOG_QUERY_MAP = {
-    "active": "class/gp/CURRENT/Y",
-    "visual": "class/gp/CURRENT/Y/OBJECT_TYPE/PAYLOAD",
+    "active": "class/gp",
+    "visual": "class/gp/OBJECT_TYPE/PAYLOAD",
     "all":    "class/gp",
 }
 

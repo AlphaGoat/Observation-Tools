@@ -1,0 +1,76 @@
+# Track-to-track correlator — stateless; every decision reads/writes
+# catalog-store over HTTP (generation/scoring/pruning/promotion, see
+# src/correlator/correlate.py). Safe to scale: no local state, and
+# catalog-store's own promote_object transaction is what keeps concurrent
+# promotions safe, not anything at this layer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: correlator
+  namespace: observation-tools
+  labels:
+    app: correlator
+    app.kubernetes.io/part-of: observation-tools
+    app.kubernetes.io/component: correlation
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: correlator
+  template:
+    metadata:
+      labels:
+        app: correlator
+    spec:
+      containers:
+        - name: correlator
+          image: observation-tools/correlator:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5005
+          env:
+            - name: PORT
+              value: "5005"
+            - name: WORKERS
+              value: "4"
+            - name: TIMEOUT
+              value: "60"
+            - name: CATALOG_STORE_URL
+              value: "http://catalog-store:5004"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5005
+            initialDelaySeconds: 8
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5005
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: correlator
+  namespace: observation-tools
+  labels:
+    app: correlator
+    app.kubernetes.io/part-of: observation-tools
+spec:
+  selector:
+    app: correlator
+  ports:
+    - name: http
+      port: 5005
+      targetPort: 5005
+  type: ClusterIP

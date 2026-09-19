@@ -11,4 +11,6 @@ resources:
   - plate-solver.yaml
   - projector.yaml
   - associator.yaml
+  - catalog-store.yaml
+  - correlator.yaml
   - pipeline-coordinator.yaml

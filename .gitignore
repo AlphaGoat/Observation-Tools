@@ -1,0 +1,12 @@
+# Generated astrometric index files (large binaries built from sstrc7/Gaia,
+# not source -- see src/astrometry/kd_tree.py build_index_tiered).
+indices/
+papers/
+*.joblib
+
+# Local catalog-store database and Python bytecode caches.
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc

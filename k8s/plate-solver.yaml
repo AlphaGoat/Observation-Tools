@@ -41,7 +41,11 @@ spec:
           volumeMounts:
             - name: index-vol
               mountPath: /indices
-              readOnly: true
+              # Not read-only: index-pvc.yaml's own documented population
+              # method is `kubectl cp` straight into this running pod's
+              # mounted path (see index-pvc.yaml and `make populate-index`),
+              # which needs write access to that exact mount to work at all.
+              # The service code itself never writes here regardless.
           resources:
             # Index files + KD-trees live in RAM — size depends on catalogue region.
             # 4 Gi covers a ~10°×10° region at scale tiers 8-11 with Gaia.

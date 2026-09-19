@@ -3,8 +3,17 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
+# scipy/joblib/astropy/astropy-healpix/matplotlib are transitive deps of
+# astrometry.kd_tree, which api.py imports for its WCS class (see kd_tree.py's
+# own imports and, further down its chain, feature_generation.py's matplotlib
+# import) -- not used directly by this service's own code.
 RUN pip install --no-cache-dir --prefix=/install \
         numpy>=1.24 \
+        scipy>=1.10 \
+        joblib>=1.3 \
+        astropy>=5.3 \
+        astropy-healpix>=1.0 \
+        matplotlib>=3.7 \
         flask>=3.0 \
         gunicorn>=21.0
 
